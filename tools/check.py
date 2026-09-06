@@ -548,9 +548,15 @@ CONVENTIONAL = re.compile(
 COURSE_TESTS = ("tests/test_filter.py", "tests/test_sort.py")
 
 
-def branch_rule_types(repo: Repo, slug: str) -> set[str] | None:
-    """Активні правила захисту main. Читає і рулсети, і класичний захист."""
+def branch_rule_types(repo: Repo, slug: str) -> tuple[set[str], dict] | None:
+    """Активні правила захисту main і параметри правила pull_request.
+
+    Читає і рулсети, і класичний захист. Ендпойнт rules/branches доступний з
+    правами на читання, тому працює і в пайплайні студента, де токен раннера
+    прав адміністратора не має.
+    """
     types: set[str] = set()
+    pr_params: dict = {}
     seen = False
 
     rules = repo.gh_json(f"repos/{slug}/rules/branches/main")
@@ -559,6 +565,8 @@ def branch_rule_types(repo: Repo, slug: str) -> set[str] | None:
         for rule in rules:
             if isinstance(rule, dict) and rule.get("type"):
                 types.add(rule["type"])
+                if rule["type"] == "pull_request":
+                    pr_params = rule.get("parameters") or {}
 
     classic = repo.gh_json(f"repos/{slug}/branches/main/protection")
     if isinstance(classic, dict):
@@ -570,7 +578,7 @@ def branch_rule_types(repo: Repo, slug: str) -> set[str] | None:
         if not (classic.get("allow_force_pushes") or {}).get("enabled", False):
             types.add("non_fast_forward")
 
-    return types if seen else None
+    return (types, pr_params) if seen else None
 
 
 def check_lr2_files(repo: Repo) -> list[Result]:
@@ -624,17 +632,18 @@ def main_ref(repo: Repo) -> str | None:
 
 def check_lr2_process(repo: Repo) -> list[Result]:
     slug = repo.slug()
-    codes = ("C1", "C2", "C3", "C4", "C5", "C6")
+    codes = ("C1", "C2", "C3", "C4", "C5", "C6", "C7")
     if not repo.gh_available() or slug is None:
         return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in codes]
 
     out: list[Result] = []
 
-    types = branch_rule_types(repo, slug)
-    if types is None:
-        note = "не вдалося прочитати захист main, потрібен доступ administration: read"
-        out.extend(Result("C", code, SKIP, note) for code in ("C1", "C2", "C3"))
+    found = branch_rule_types(repo, slug)
+    if found is None:
+        note = "не вдалося прочитати захист main"
+        out.extend(Result("C", code, SKIP, note) for code in ("C1", "C2", "C3", "C7"))
     else:
+        types, pr_params = found
         checks = (
             ("C1", "pull_request", "злиття в main тільки через pull request"),
             ("C2", "required_linear_history", "лінійна історія увімкнена"),
@@ -645,6 +654,22 @@ def check_lr2_process(repo: Repo) -> list[Result]:
                 out.append(Result("C", code, OK, message))
             else:
                 out.append(Result("C", code, FAIL, "не увімкнено: " + message))
+
+        # Підпункт, який GitHub вмикає за замовчуванням. Він вимагає окремого
+        # апрува, коли в pull request є коміти чужого авторства, а виклики курсу
+        # приходять саме такими. У соло-репозиторії апрувати нікому.
+        if pr_params.get("require_extra_approval_for_unattributed_changes"):
+            out.append(
+                Result(
+                    "C",
+                    "C7",
+                    WARN,
+                    "у правилі pull request увімкнено додатковий апрув для комітів "
+                    "чужого авторства: зміни курсу через cherry-pick можуть не злитись",
+                )
+            )
+        else:
+            out.append(Result("C", "C7", OK, "додаткового апрува для чужих комітів не вимагається"))
 
     ref = main_ref(repo)
     if ref is None:
