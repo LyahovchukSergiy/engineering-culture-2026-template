@@ -19,8 +19,13 @@ def health() -> dict[str, str]:
 
 
 @app.get("/items", response_model=list[Item])
-def list_items() -> list[Item]:
-    return storage.list_all()
+def list_items(sort: str = "created_at") -> list[Item]:
+    items = storage.list_all()
+    newest_first = sort.startswith("-")
+    field = sort.lstrip("-")
+    if field != "created_at":
+        raise HTTPException(status_code=422, detail="Сортувати можна лише за created_at")
+    return sorted(items, key=lambda item: item.created_at, reverse=newest_first)
 
 
 @app.post("/items", response_model=Item, status_code=201)
