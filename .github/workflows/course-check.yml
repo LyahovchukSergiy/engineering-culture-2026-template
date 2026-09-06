@@ -1,0 +1,49 @@
+# Валідатор курсу. Ганяється сам на кожен push і кожен pull request, тому ставити
+# і запускати нічого не треба: результат видно у вкладці Actions і галочкою біля
+# коміту.
+#
+# Свіжу версію правил workflow тягне з репозиторію курсу, а не бере копію з вашого
+# репозиторію. Так правила для наступних робіт доїжджають до вас самі.
+#
+# Червона галочка тут поки робота не дороблена це нормально і очікувано. Зелена
+# означає, що формальні вимоги закриті. Залежності ставить make, тому заодно
+# перевіряється, що ваш проєкт піднімається на чистій машині.
+#
+# Цей файл ви не редагуєте. Свій пайплайн ви налагоджуєте в ci.yml.
+
+name: Перевірка курсу
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  course-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрати код
+        uses: actions/checkout@v4
+
+      - name: Поставити Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Забрати свіжий валідатор курсу
+        run: |
+          BASE=https://raw.githubusercontent.com/LyahovchukSergiy/engineering-culture-2026-template/main/tools
+          mkdir -p .course
+          curl -fsSL "$BASE/check.py" -o .course/check.py
+          curl -fsSL "$BASE/course.json" -o .course/course.json
+
+      - name: Перевірка
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .course/check.py --slow --strict --summary "$GITHUB_STEP_SUMMARY"

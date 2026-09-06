@@ -25,6 +25,7 @@ class Settings:
     host: str
     port: int
     log_level: str
+    reload: bool
 
 
 def load_settings() -> Settings:
@@ -34,6 +35,7 @@ def load_settings() -> Settings:
         host=_env("APP_HOST", "127.0.0.1"),
         port=int(_env("APP_PORT", "8000")),
         log_level=_env("APP_LOG_LEVEL", "info"),
+        reload=_env("APP_RELOAD", "0").lower() in {"1", "true", "yes"},
     )
 
 

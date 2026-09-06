@@ -1,0 +1,5 @@
+{
+  "current_lr": 1,
+  "template_repo": "LyahovchukSergiy/engineering-culture-2026-template",
+  "_": "Викладач міняє current_lr після кожної пари. Репозиторії студентів беруть це число автоматично, нічого перевстановлювати не треба."
+}

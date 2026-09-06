@@ -31,7 +31,7 @@ test: install
 	$(PY) -m pytest
 
 run: install
-	$(PY) -m app
+	APP_RELOAD=1 $(PY) -m app
 
 build:
 	docker build -t $(IMAGE):$(TAG) .
