@@ -518,14 +518,49 @@ def check_c(repo: Repo) -> list[Result]:
 # Складання
 # --------------------------------------------------------------------------- #
 
-CONFIG_PATH = Path(__file__).with_name("course.json")
+RAW_BASE = (
+    "https://raw.githubusercontent.com/"
+    "LyahovchukSergiy/engineering-culture-2026-template/main/tools"
+)
+
+_data_cache: dict[str, dict | None] = {}
+
+
+def course_file(name: str) -> dict | None:
+    """Дані курсу: спершу файл поруч зі скриптом, потім свіжа копія з репозиторію
+    курсу. Другий шлях потрібен тому, що workflow у репозиторії студента створений
+    на ЛР1 і тягне лише два файли. Усе, що курс додасть пізніше, доїжджає сюди, а
+    не через правку чужих репозиторіїв. Мережі може не бути, тоді None."""
+    if name in _data_cache:
+        return _data_cache[name]
+    value = None
+    local = Path(__file__).with_name(name)
+    try:
+        value = json.loads(local.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        try:
+            with urllib.request.urlopen(f"{RAW_BASE}/{name}", timeout=15) as response:
+                value = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, ValueError, OSError):
+            value = None
+    _data_cache[name] = value
+    return value
 
 
 def course_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"current_lr": 1}
+    return course_file("course.json") or {"current_lr": 1}
+
+
+def rotation_entry(login: str) -> tuple[dict | None, dict | None]:
+    """Рядок таблиці ротації для власника репозиторію: кого він рев'ює на ЛР3,
+    чий onboarding проходить на ЛР8, чий портфель дивиться на ЛР13."""
+    table = course_file("rotation.json")
+    if not table:
+        return None, None
+    for item in table.get("students", []):
+        if item.get("github", "").lower() == login.lower():
+            return item, table
+    return None, table
 
 
 def prefixed(results: list[Result], tag: str) -> list[Result]:
@@ -745,6 +780,56 @@ def render(results: list[Result], lr: int) -> str:
     return "\n".join(lines)
 
 
+def rotation_lines(repo: Repo) -> list[str]:
+    """Рядок таблиці ротації у вигляді готового шматка звіту. Питання «а кого мені
+    рев'ювати» приходить кожного разу, а таблиця в issue довга, тому відповідь
+    друкується там, куди студент і так дивиться після кожного push."""
+    slug = repo.slug()
+    if slug is None:
+        return ["Не видно remote origin, тому невідомо, чий це репозиторій."]
+    login = slug.split("/")[0]
+    entry, table = rotation_entry(login)
+    if table is None:
+        return ["Таблиці ротації ще немає: вона з'являється до пари ЛР3."]
+    if entry is None:
+        return [
+            f"Логіна `{login}` у таблиці ротації немає. Перевір, чи стоїть твій рядок "
+            "у закріпленій issue «Репозиторії потоку 2026», і напиши про це в issue ротації."
+        ]
+    fallback = table.get("fallback", {})
+    repos = {
+        item.get("github", "").lower(): item.get("repo", "")
+        for item in table.get("students", [])
+    }
+    titles = {
+        "lr03": "ЛР3, рев'ю pull request",
+        "lr08": "ЛР8, onboarding за README",
+        "lr13": "ЛР13, рев'ю портфеля",
+    }
+    out = [f"{login}, підгрупа {entry.get('subgroup', '?')}, номер {entry.get('n', '?')} у кільці."]
+    for work, title in titles.items():
+        shown = []
+        for name in entry.get(work) or []:
+            if name:
+                slug_other = repos.get(name.lower())
+                shown.append(f"https://github.com/{slug_other}" if slug_other else name)
+            else:
+                spare = fallback.get(work) or "посилання буде в issue ротації до пари"
+                shown.append(f"об'єкт курсу ({spare})")
+        out.append(f"- {title}: {', '.join(shown) if shown else "об'єкт курсу"}")
+    incoming = entry.get("lr03_reviewers") or []
+    if incoming:
+        out.append(f"- твій PR на ЛР3 читають: {', '.join(incoming)}")
+    return out
+
+
+def show_rotation(repo: Repo) -> int:
+    """Режим --who для тих, у кого під рукою свіжа копія скрипта."""
+    for line in rotation_lines(repo):
+        print(line)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Валідатор репозиторію курсу")
     parser.add_argument("--repo", default=".", help="каталог репозиторію")
@@ -756,7 +841,13 @@ def main() -> int:
     parser.add_argument(
         "--strict", action="store_true", help="повернути код 1, якщо є хоч один FAIL"
     )
+    parser.add_argument(
+        "--who", action="store_true", help="показати свій рядок таблиці ротації рев'ю"
+    )
     args = parser.parse_args()
+
+    if args.who:
+        return show_rotation(Repo(Path(args.repo)))
 
     lr = args.lr or int(course_config().get("current_lr", 1))
     if lr not in CHECKS:
@@ -766,6 +857,9 @@ def main() -> int:
     repo = Repo(Path(args.repo))
     results = CHECKS[lr](repo, args.slow)
     report = render(results, lr)
+
+    if lr >= 3:
+        report += "\n\n## Ротація рев'ю\n\n" + "\n".join(rotation_lines(repo)) + "\n"
 
     print(report)
     if args.summary:
