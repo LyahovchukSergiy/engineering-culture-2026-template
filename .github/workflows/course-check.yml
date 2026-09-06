@@ -22,6 +22,7 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  administration: read
 
 jobs:
   course-check:
@@ -32,6 +33,10 @@ jobs:
     steps:
       - name: Забрати код
         uses: actions/checkout@v7
+        with:
+          # Повна історія потрібна перевіркам ЛР2: лінійність main і формат
+          # повідомлень комітів рахуються по всій гілці, а не по останньому коміту.
+          fetch-depth: 0
 
       - name: Поставити Python
         uses: actions/setup-python@v7

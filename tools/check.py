@@ -434,13 +434,16 @@ def check_c(repo: Repo) -> list[Result]:
     owner = slug.split("/")[0]
     out: list[Result] = []
 
-    raw_issues = repo.gh_json(f"repos/{slug}/issues?state=open&per_page=100")
+    raw_issues = repo.gh_json(f"repos/{slug}/issues?state=all&per_page=100")
     if raw_issues is None:
         return [
             Result("C", code, SKIP, "GitHub API не віддав issue")
             for code in ("C1", "C2", "C3", "C4", "C5")
         ]
 
+    # Рахуються заведені студентом issue незалежно від стану: на ЛР1 одна з
+    # шести закривається через PR, а на ЛР2 закриваються ще дві. Якби правило
+    # дивилось лише на відкриті, воно карало б саме тих, хто зробив роботу.
     issues = [
         item
         for item in raw_issues
@@ -448,9 +451,9 @@ def check_c(repo: Repo) -> list[Result]:
     ]
 
     if len(issues) >= 6:
-        out.append(Result("C", "C1", OK, f"відкритих власних issue: {len(issues)}"))
+        out.append(Result("C", "C1", OK, f"заведених власних issue: {len(issues)}"))
     else:
-        out.append(Result("C", "C1", FAIL, f"відкритих власних issue {len(issues)}, потрібно 6"))
+        out.append(Result("C", "C1", FAIL, f"заведених власних issue {len(issues)}, потрібно 6"))
 
     with_criteria = sum(
         1
@@ -497,12 +500,7 @@ def check_c(repo: Repo) -> list[Result]:
             )
         )
 
-    closed = repo.gh_json(f"repos/{slug}/issues?state=closed&per_page=100") or []
-    closed_own = [
-        item
-        for item in closed
-        if "pull_request" not in item and (item.get("user") or {}).get("login") == owner
-    ]
+    closed_own = [item for item in issues if item.get("state") == "closed"]
     if closed_own:
         out.append(Result("C", "C5", OK, f"закритих власних issue: {len(closed_own)}"))
     else:
@@ -530,11 +528,171 @@ def course_config() -> dict:
         return {"current_lr": 1}
 
 
+def prefixed(results: list[Result], tag: str) -> list[Result]:
+    """Позначає, з якої роботи правило, коли перевірка йде накопичувально."""
+    return [Result(item.block, f"{tag}.{item.code}", item.level, item.message) for item in results]
+
+
 def run_lr1(repo: Repo, run_slow: bool) -> list[Result]:
     return check_a(repo) + check_b(repo, run_slow) + check_c(repo)
 
 
-CHECKS = {1: run_lr1}
+# --------------------------------------------------------------------------- #
+# ЛР2. Шлях задачі
+# --------------------------------------------------------------------------- #
+
+CONVENTIONAL = re.compile(
+    r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .+"
+)
+
+COURSE_TESTS = ("tests/test_filter.py", "tests/test_sort.py")
+
+
+def branch_rule_types(repo: Repo, slug: str) -> set[str] | None:
+    """Активні правила захисту main. Читає і рулсети, і класичний захист."""
+    types: set[str] = set()
+    seen = False
+
+    rules = repo.gh_json(f"repos/{slug}/rules/branches/main")
+    if isinstance(rules, list):
+        seen = True
+        for rule in rules:
+            if isinstance(rule, dict) and rule.get("type"):
+                types.add(rule["type"])
+
+    classic = repo.gh_json(f"repos/{slug}/branches/main/protection")
+    if isinstance(classic, dict):
+        seen = True
+        if classic.get("required_pull_request_reviews") is not None:
+            types.add("pull_request")
+        if (classic.get("required_linear_history") or {}).get("enabled"):
+            types.add("required_linear_history")
+        if not (classic.get("allow_force_pushes") or {}).get("enabled", False):
+            types.add("non_fast_forward")
+
+    return types if seen else None
+
+
+def check_lr2_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    template = repo.read(".github/PULL_REQUEST_TEMPLATE.md")
+    if template is None:
+        out.append(Result("A", "A1", FAIL, ".github/PULL_REQUEST_TEMPLATE.md не знайдено"))
+        out.append(Result("A", "A2", FAIL, "шаблон PR відсутній, поля про AI немає"))
+    else:
+        out.append(Result("A", "A1", OK, "шаблон pull request на місці"))
+        if re.search(r"\bAI\b", template, re.IGNORECASE):
+            out.append(Result("A", "A2", OK, "у шаблоні PR є рядок про AI"))
+        else:
+            out.append(Result("A", "A2", FAIL, "у шаблоні PR немає рядка про AI"))
+
+    missing = [name for name in COURSE_TESTS if not repo.exists(name)]
+    if missing:
+        out.append(Result("B", "B1", FAIL, "немає тестів виклику: " + ", ".join(missing)))
+    else:
+        out.append(Result("B", "B1", OK, "обидва тести виклику на місці"))
+
+    markers = []
+    for item in repo.text_files():
+        content = item.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^<{7} |^={7}$|^>{7} ", content, re.MULTILINE):
+            markers.append(str(item.relative_to(repo.path)))
+    if markers:
+        out.append(
+            Result("B", "B2", FAIL, "маркери конфлікту лишились у: " + ", ".join(markers[:5]))
+        )
+    else:
+        out.append(Result("B", "B2", OK, "маркерів конфлікту в коді немає"))
+
+    return out
+
+
+def main_ref(repo: Repo) -> str | None:
+    """Посилання на головну гілку.
+
+    У пайплайні на подію pull_request робоче дерево це штучний merge-коміт, і
+    рахувати історію по ньому не можна: там завжди буде merge. Тому спершу
+    беремо віддалений main, і лише якщо його немає, локальний.
+    """
+    for candidate in ("refs/remotes/origin/main", "refs/heads/main"):
+        done = repo.run(["git", "rev-parse", "--verify", "--quiet", candidate])
+        if done.returncode == 0:
+            return candidate
+    return None
+
+
+def check_lr2_process(repo: Repo) -> list[Result]:
+    slug = repo.slug()
+    codes = ("C1", "C2", "C3", "C4", "C5", "C6")
+    if not repo.gh_available() or slug is None:
+        return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in codes]
+
+    out: list[Result] = []
+
+    types = branch_rule_types(repo, slug)
+    if types is None:
+        note = "не вдалося прочитати захист main, потрібен доступ administration: read"
+        out.extend(Result("C", code, SKIP, note) for code in ("C1", "C2", "C3"))
+    else:
+        checks = (
+            ("C1", "pull_request", "злиття в main тільки через pull request"),
+            ("C2", "required_linear_history", "лінійна історія увімкнена"),
+            ("C3", "non_fast_forward", "force push у main заборонений"),
+        )
+        for code, needed, message in checks:
+            if needed in types:
+                out.append(Result("C", code, OK, message))
+            else:
+                out.append(Result("C", code, FAIL, "не увімкнено: " + message))
+
+    ref = main_ref(repo)
+    if ref is None:
+        out.extend(
+            Result("C", code, SKIP, "гілка main недоступна локально") for code in ("C4", "C5", "C6")
+        )
+        return out
+
+    merges = repo.run(["git", "rev-list", "--merges", "--count", ref])
+    if merges.returncode == 0:
+        count = int(merges.stdout.strip() or 0)
+        if count == 0:
+            out.append(Result("C", "C4", OK, "merge-комітів у main немає, історія лінійна"))
+        else:
+            out.append(
+                Result("C", "C4", FAIL, f"у main merge-комітів: {count}, історія не лінійна")
+            )
+    else:
+        out.append(Result("C", "C4", SKIP, "не вдалося прочитати історію main"))
+
+    log = repo.run(["git", "log", "--format=%s", "-30", ref])
+    subjects = [line for line in log.stdout.splitlines() if line.strip()]
+    body = subjects[:-1] if len(subjects) > 1 else subjects
+    bad = [line for line in body if not CONVENTIONAL.match(line)]
+    if not body:
+        out.append(Result("C", "C5", SKIP, "історія main порожня"))
+    elif len(bad) <= 2:
+        out.append(
+            Result("C", "C5", OK, f"Conventional Commits: {len(body) - len(bad)} з {len(body)}")
+        )
+    else:
+        out.append(Result("C", "C5", FAIL, "не за Conventional Commits: " + "; ".join(bad[:3])))
+
+    if any(re.search(r"revert", line, re.IGNORECASE) for line in subjects):
+        out.append(Result("C", "C6", OK, "у main є коміт відкату"))
+    else:
+        out.append(Result("C", "C6", FAIL, "у main немає коміта, у назві якого є слово revert"))
+
+    return out
+
+
+def run_lr2(repo: Repo, run_slow: bool) -> list[Result]:
+    return prefixed(run_lr1(repo, run_slow), "ЛР1") + prefixed(
+        check_lr2_files(repo) + check_lr2_process(repo), "ЛР2"
+    )
+
+
+CHECKS = {1: run_lr1, 2: run_lr2}
 
 
 def render(results: list[Result], lr: int) -> str:
