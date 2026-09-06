@@ -18,11 +18,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# У GITHUB_TOKEN немає дозволу administration, тому налаштування захисту main
+# читаються ендпойнтом rules/branches, якому достатньо доступу на читання.
 permissions:
   contents: read
   issues: read
   pull-requests: read
-  administration: read
 
 jobs:
   course-check:
