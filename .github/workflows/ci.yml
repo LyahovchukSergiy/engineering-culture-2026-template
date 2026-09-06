@@ -1,0 +1,33 @@
+# Заготовка пайплайна: лінтер і тести на кожен pull request.
+# Складання образу і required checks додаються на ЛР4.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрати код
+        uses: actions/checkout@v4
+
+      - name: Поставити Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Поставити залежності
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Лінтер
+        run: ruff check .
+
+      - name: Тести
+        run: pytest
