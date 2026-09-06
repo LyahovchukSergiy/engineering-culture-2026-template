@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 
 from app import __version__
 from app.config import settings
-from app.models import Item, ItemCreate
+from app.models import Item, ItemCreate, ItemStatus
 from app.storage import storage
 
 app = FastAPI(title=settings.app_name, version=__version__)
@@ -19,8 +19,11 @@ def health() -> dict[str, str]:
 
 
 @app.get("/items", response_model=list[Item])
-def list_items() -> list[Item]:
-    return storage.list_all()
+def list_items(status: ItemStatus | None = None) -> list[Item]:
+    items = storage.list_all()
+    if status is not None:
+        items = [item for item in items if item.status == status]
+    return items
 
 
 @app.post("/items", response_model=Item, status_code=201)
