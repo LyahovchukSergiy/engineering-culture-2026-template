@@ -25,6 +25,9 @@ permissions:
 
 jobs:
   course-check:
+    # У самому шаблоні перевірка не має сенсу: там немає ні issue, ні pull
+    # request, тому вона була б вічно червоною і виглядала б як зламаний шаблон.
+    if: github.repository != 'LyahovchukSergiy/engineering-culture-2026-template'
     runs-on: ubuntu-latest
     steps:
       - name: Забрати код
