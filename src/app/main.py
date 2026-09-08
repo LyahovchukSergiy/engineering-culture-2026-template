@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 
 from app import __version__
 from app.config import settings
-from app.models import Item, ItemCreate
+from app.models import Item, ItemCreate, ItemPage
 from app.storage import storage
 
 app = FastAPI(title=settings.app_name, version=__version__)
@@ -18,9 +18,14 @@ def health() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
 
 
-@app.get("/items", response_model=list[Item])
-def list_items() -> list[Item]:
-    return storage.list_all()
+@app.get("/items", response_model=ItemPage)
+def list_items(limit: int = 20, offset: int = 0) -> ItemPage:
+    items = storage.list_all()
+    if limit > 100:
+        limit = 100
+    print(f"list_items limit={limit} offset={offset}")
+    page = items[offset:limit]
+    return ItemPage(items=page, total=len(storage.list_all()))
 
 
 @app.post("/items", response_model=Item, status_code=201)
