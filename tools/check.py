@@ -30,6 +30,7 @@ SKIP, а не падають.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -746,13 +747,336 @@ def check_lr2_process(repo: Repo) -> list[Result]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# ЛР3. Стандарти коду, рефакторинг і рев'ю
+# --------------------------------------------------------------------------- #
+
+ADR_SECTIONS = ("Статус", "Контекст", "Рішення", "Наслідки")
+PRICING_TESTS = "tests/legacy/test_pricing.py"
+PRICING_EXPECTED = ("200.0", "1020.0", "535.0", "450.0")
+REVIEW_TAG = re.compile(r"^\s*(blocker|suggestion|nit)\s*:", re.IGNORECASE)
+PR_LINK = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
+
+
+def codeowners(repo: Repo) -> str | None:
+    for place in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+        text = repo.read(place)
+        if text is not None:
+            return text
+    return None
+
+
+def adr_files(repo: Repo) -> list[str]:
+    return sorted(
+        name
+        for name in repo.tracked_files()
+        if re.fullmatch(r"docs/adr/\d{4}-[^/]+\.md", name)
+    )
+
+
+def check_lr3_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    hooks = repo.read(".pre-commit-config.yaml")
+    if hooks is None:
+        out.append(Result("A", "A1", FAIL, ".pre-commit-config.yaml не знайдено"))
+        out.append(Result("A", "A2", FAIL, "без конфігурації pre-commit хука форматера немає"))
+    else:
+        out.append(Result("A", "A1", OK, "конфігурація pre-commit на місці"))
+        if re.search(r"ruff-format|black|format", hooks, re.IGNORECASE):
+            out.append(Result("A", "A2", OK, "у pre-commit є хук форматера"))
+        else:
+            out.append(Result("A", "A2", FAIL, "у pre-commit немає хука форматера"))
+
+    owners = codeowners(repo)
+    if owners is None:
+        out.append(Result("A", "A3", FAIL, "CODEOWNERS не знайдено ні в .github/, ні в корені"))
+    elif "@" in owners:
+        out.append(Result("A", "A3", OK, "CODEOWNERS на місці і називає власника"))
+    else:
+        out.append(Result("A", "A3", FAIL, "у CODEOWNERS немає жодного @власника"))
+
+    records = adr_files(repo)
+    if len(records) < 2:
+        out.append(
+            Result("A", "A4", FAIL, f"ADR у docs/adr знайдено {len(records)}, потрібно два")
+        )
+        out.append(Result("A", "A5", FAIL, "немає двох ADR, розділи перевіряти нема в чому"))
+        out.append(
+            Result("A", "A6", FAIL, "немає двох ADR, посилання на PR не перевірити")
+        )
+    else:
+        out.append(Result("A", "A4", OK, f"ADR знайдено: {len(records)}"))
+        broken = []
+        without_pr = []
+        for name in records:
+            text = repo.read(name) or ""
+            missing_sections = [
+                section
+                for section in ADR_SECTIONS
+                if not re.search(rf"^#+\s*{section}", text, re.MULTILINE)
+            ]
+            if missing_sections:
+                broken.append(name)
+            if not PR_LINK.search(text):
+                without_pr.append(name)
+        if broken:
+            out.append(
+                Result("A", "A5", FAIL, "немає всіх чотирьох розділів у: " + ", ".join(broken))
+            )
+        else:
+            out.append(Result("A", "A5", OK, "у кожному ADR чотири розділи"))
+        if without_pr:
+            out.append(
+                Result(
+                    "A",
+                    "A6",
+                    FAIL,
+                    "немає посилання на pull request у: " + ", ".join(without_pr),
+                )
+            )
+        else:
+            out.append(Result("A", "A6", OK, "кожен ADR посилається на pull request"))
+
+    log = repo.read("docs/review-log.md")
+    if log is None:
+        out.append(Result("A", "A7", FAIL, "docs/review-log.md не знайдено"))
+    else:
+        slug = repo.slug() or "/"
+        owner = slug.split("/")[0].lower()
+        foreign = {
+            (found[0], found[1], found[2])
+            for found in PR_LINK.findall(log)
+            if found[0].lower() != owner
+        }
+        if len(foreign) >= 2:
+            out.append(Result("A", "A7", OK, f"у журналі рев'ю чужих pull request: {len(foreign)}"))
+        else:
+            out.append(
+                Result(
+                    "A",
+                    "A7",
+                    FAIL,
+                    f"у журналі рев'ю посилань на чужі pull request {len(foreign)}, потрібно два",
+                )
+            )
+
+    tests = repo.read(PRICING_TESTS)
+    if tests is None:
+        out.append(Result("B", "B1", FAIL, f"{PRICING_TESTS} зник, а його правити не можна"))
+    else:
+        lost = [value for value in PRICING_EXPECTED if value not in tests]
+        if lost:
+            out.append(
+                Result("B", "B1", FAIL, "у тестах курсу змінені очікування: " + ", ".join(lost))
+            )
+        else:
+            out.append(Result("B", "B1", OK, "тести курсу до pricing.py не змінені"))
+
+    out.append(pricing_refactored(repo))
+
+    makefile = repo.read("Makefile") or ""
+    lint_target = re.search(r"^lint:.*?(?=^\w|\Z)", makefile, re.MULTILINE | re.DOTALL)
+    if lint_target and "format" in lint_target.group(0):
+        out.append(Result("B", "B3", OK, "make lint перевіряє і форматування"))
+    else:
+        out.append(Result("B", "B3", FAIL, "у цілі lint немає перевірки форматування"))
+
+    return out
+
+
+def pricing_refactored(repo: Repo) -> Result:
+    """Чи це справді рефакторинг, а не прогін форматера.
+
+    Одного коміта мало: на кроці 1 студент проганяє форматер по всьому
+    репозиторію, і файл змінюється сам собою. Тому додатково дивимось на сліди
+    роботи, яких вимагає умова: названі числа або розбиття на функції.
+    """
+    touched = repo.run(["git", "log", "--oneline", "--", "legacy/pricing.py"])
+    commits = len([line for line in touched.stdout.splitlines() if line.strip()])
+    if commits < 2:
+        return Result("B", "B2", FAIL, "legacy/pricing.py лишився таким, як у шаблоні")
+
+    source = repo.read("legacy/pricing.py") or ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as error:
+        return Result("B", "B2", FAIL, f"legacy/pricing.py не парситься: {error}")
+
+    constants = [
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id.isupper()
+    ]
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    if constants or len(functions) > 1:
+        return Result(
+            "B",
+            "B2",
+            OK,
+            f"рефакторинг видно: названих констант {len(constants)}, функцій {len(functions)}",
+        )
+    return Result(
+        "B",
+        "B2",
+        FAIL,
+        "у legacy/pricing.py немає ні названих чисел, ні поділу на функції: "
+        "схоже, файл лише переформатований",
+    )
+
+
+def refactor_pull_request(repo: Repo, slug: str) -> dict | None:
+    """Pull request, яким рефакторинг приїхав у main."""
+    log = repo.run(["git", "log", "-1", "--format=%H", "--", "legacy/pricing.py"])
+    sha = log.stdout.strip()
+    if not sha:
+        return None
+    found = repo.gh_json(f"repos/{slug}/commits/{sha}/pulls")
+    if not isinstance(found, list) or not found:
+        return None
+    return found[0]
+
+
+def check_lr3_process(repo: Repo) -> list[Result]:
+    slug = repo.slug()
+    codes = ("C1", "C2", "C3", "C4")
+    if not repo.gh_available() or slug is None:
+        return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in codes]
+
+    out: list[Result] = []
+    login = slug.split("/")[0]
+
+    pull = refactor_pull_request(repo, slug)
+    if pull is None:
+        out.append(Result("C", "C1", FAIL, "рефакторинг pricing.py не прийшов через pull request"))
+        out.append(Result("C", "C2", SKIP, "немає pull request рефакторингу"))
+    else:
+        number = pull.get("number")
+        out.append(Result("C", "C1", OK, f"рефакторинг прийшов через pull request #{number}"))
+        opened = pull.get("created_at") or ""
+        merged = pull.get("merged_at") or ""
+        comments = repo.gh_json(f"repos/{slug}/pulls/{number}/comments") or []
+        outside = [
+            item
+            for item in comments
+            if isinstance(item, dict)
+            and (item.get("user") or {}).get("login", "").lower() != login.lower()
+        ]
+        hours = 0.0
+        if opened and merged:
+            fmt = "%Y-%m-%dT%H:%M:%SZ"
+            hours = (
+                time.mktime(time.strptime(merged, fmt)) - time.mktime(time.strptime(opened, fmt))
+            ) / 3600
+        if outside:
+            out.append(
+                Result(
+                    "C",
+                    "C2",
+                    OK,
+                    f"pull request #{number} прочитали інші: коментарів {len(outside)}",
+                )
+            )
+        elif not merged or hours >= 24:
+            out.append(
+                Result("C", "C2", OK, f"pull request #{number} чекав {hours:.0f} год")
+            )
+        else:
+            out.append(
+                Result(
+                    "C",
+                    "C2",
+                    WARN,
+                    f"pull request #{number} злитий через {hours:.0f} год і без чужих коментарів: "
+                    "рев'ювати його не було коли",
+                )
+            )
+
+    log = repo.read("docs/review-log.md") or ""
+    targets = {found for found in PR_LINK.findall(log) if found[0].lower() != login.lower()}
+    if not targets:
+        out.append(
+            Result("C", "C3", FAIL, "у docs/review-log.md немає чужих pull request")
+        )
+        out.append(
+            Result("C", "C4", SKIP, "немає чужих pull request, теги не перевірити")
+        )
+        return out
+
+    good = []
+    thin = []
+    untagged = []
+    unreadable = []
+    for owner, name, number in sorted(targets):
+        comments = repo.gh_json(f"repos/{owner}/{name}/pulls/{number}/comments")
+        if comments is None:
+            unreadable.append(f"{owner}/{name}#{number}")
+            continue
+        mine = [
+            item
+            for item in comments
+            if isinstance(item, dict)
+            and (item.get("user") or {}).get("login", "").lower() == login.lower()
+        ]
+        if len(mine) < 3:
+            thin.append(f"{owner}/{name}#{number}: коментарів {len(mine)}")
+            continue
+        good.append(f"{owner}/{name}#{number}")
+        if not all(REVIEW_TAG.match(item.get("body") or "") for item in mine):
+            untagged.append(f"{owner}/{name}#{number}")
+
+    if unreadable and not good:
+        out.append(Result("C", "C3", SKIP, "не вдалося прочитати: " + ", ".join(unreadable)))
+        out.append(Result("C", "C4", SKIP, "коментарі недоступні"))
+        return out
+
+    if len(good) >= 2:
+        out.append(Result("C", "C3", OK, "рев'ю з трьома коментарями і більше: " + ", ".join(good)))
+    else:
+        note = "; ".join(thin) or "рев'ю не знайдено"
+        out.append(
+            Result(
+                "C",
+                "C3",
+                FAIL,
+                f"повних рев'ю {len(good)} з двох, треба по три коментарі: {note}",
+            )
+        )
+
+    if untagged:
+        out.append(
+            Result(
+                "C",
+                "C4",
+                FAIL,
+                "коментарі без позначки blocker, suggestion або nit у: " + ", ".join(untagged),
+            )
+        )
+    elif good:
+        out.append(Result("C", "C4", OK, "кожен коментар позначений типом"))
+    else:
+        out.append(Result("C", "C4", SKIP, "немає повних рев'ю, теги перевіряти нема на чому"))
+
+    return out
+
+
+def run_lr3(repo: Repo, run_slow: bool) -> list[Result]:
+    return (
+        prefixed(run_lr1(repo, run_slow), "ЛР1")
+        + prefixed(check_lr2_files(repo) + check_lr2_process(repo), "ЛР2")
+        + prefixed(check_lr3_files(repo) + check_lr3_process(repo), "ЛР3")
+    )
+
+
 def run_lr2(repo: Repo, run_slow: bool) -> list[Result]:
     return prefixed(run_lr1(repo, run_slow), "ЛР1") + prefixed(
         check_lr2_files(repo) + check_lr2_process(repo), "ЛР2"
     )
 
 
-CHECKS = {1: run_lr1, 2: run_lr2}
+CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3}
 
 
 def render(results: list[Result], lr: int) -> str:
