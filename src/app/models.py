@@ -21,3 +21,8 @@ class ItemCreate(BaseModel):
 class Item(ItemCreate):
     id: int
     created_at: datetime
+
+
+class ItemPage(BaseModel):
+    items: list[Item]
+    total: int
