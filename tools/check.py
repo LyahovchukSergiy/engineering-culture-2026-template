@@ -1076,7 +1076,372 @@ def run_lr2(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
-CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3}
+# --------------------------------------------------------------------------- #
+# ЛР4. Тести і CI
+# --------------------------------------------------------------------------- #
+
+CI_WORKFLOW = ".github/workflows/ci.yml"
+MUTANTS_WORKFLOW = ".github/workflows/mutants.yml"
+COVERAGE_ARTIFACT = "coverage-html"
+REQUIRED_CONTEXTS = ("lint", "test")
+
+# Тести, які прийшли з курсом. Власними вони не рахуються: ЛР4 просить дописати
+# свої, а не залишити те, що вже лежало в шаблоні і у виклику ЛР2.
+COURSE_OWNED_TESTS = {
+    "tests/legacy/test_pricing.py",
+    "tests/test_health.py",
+    "tests/test_items.py",
+    "tests/test_filter.py",
+    "tests/test_sort.py",
+}
+
+BADGE = re.compile(r"actions/workflows/[\w.-]+/badge\.svg")
+PRIVATE_PRICING = re.compile(r"\bpricing\._\w+")
+
+
+def own_test_files(repo: Repo) -> list[str]:
+    return [
+        name
+        for name in repo.tracked_files()
+        if re.fullmatch(r"tests/(?:[^/]+/)*test_[^/]+\.py", name) and name not in COURSE_OWNED_TESTS
+    ]
+
+
+def test_functions(tree: ast.AST) -> list[ast.FunctionDef]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ]
+
+
+def uses_http_client(node: ast.AST) -> bool:
+    """Чи б'є тест у ендпойнт. Ознака це виклик методу на об'єкті з ім'ям client."""
+    for item in ast.walk(node):
+        if isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name):
+            if "client" in item.value.id.lower() and item.attr in {
+                "get",
+                "post",
+                "put",
+                "patch",
+                "delete",
+            }:
+                return True
+    return False
+
+
+def parsed_tests(repo: Repo) -> list[tuple[str, str, ast.AST]]:
+    out = []
+    for name in own_test_files(repo):
+        source = repo.read(name)
+        if source is None:
+            continue
+        try:
+            out.append((name, source, ast.parse(source)))
+        except SyntaxError:
+            continue
+    return out
+
+
+def check_lr4_tests(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+    files = parsed_tests(repo)
+
+    pricing_tests = 0
+    for _, source, tree in files:
+        if "calculate_order_total" not in source:
+            continue
+        pricing_tests += len(test_functions(tree))
+    if pricing_tests >= 6:
+        out.append(Result("A", "A1", OK, f"власних тестів до pricing.py: {pricing_tests}"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A1",
+                FAIL,
+                f"власних тестів до pricing.py {pricing_tests}, потрібно щонайменше 6",
+            )
+        )
+
+    private = []
+    for name, source, tree in files:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("pricing"):
+                private += [
+                    f"{name}: {alias.name}" for alias in node.names if alias.name.startswith("_")
+                ]
+        if PRIVATE_PRICING.search(source):
+            private.append(f"{name}: звернення до приватного імені модуля")
+    if private:
+        out.append(
+            Result(
+                "A",
+                "A2",
+                FAIL,
+                "тест звертається не до публічної функції: "
+                + "; ".join(private[:3])
+                + ". Після підміни мутантом такий тест дасть ImportError",
+            )
+        )
+    else:
+        out.append(Result("A", "A2", OK, "тести звертаються до публічної функції модуля"))
+
+    integration = 0
+    for _, _, tree in files:
+        integration += sum(1 for node in test_functions(tree) if uses_http_client(node))
+    if integration >= 2:
+        out.append(Result("A", "A3", OK, f"власних інтеграційних тестів: {integration}"))
+    else:
+        out.append(
+            Result("A", "A3", FAIL, f"власних інтеграційних тестів {integration}, потрібно 2")
+        )
+
+    return out
+
+
+def check_lr4_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    if repo.exists(MUTANTS_WORKFLOW):
+        out.append(Result("A", "A4", OK, "mutants.yml на місці"))
+    else:
+        out.append(Result("A", "A4", FAIL, f"{MUTANTS_WORKFLOW} не знайдено"))
+
+    notes = repo.read("docs/ci.md")
+    if notes is None:
+        out.append(Result("A", "A5", FAIL, "docs/ci.md не знайдено"))
+    else:
+        blocks = len(re.findall(r"^#{2,}\s+\S", notes, re.MULTILINE)) or len(
+            re.findall(r"^\s*(?:[-*+]|\d+\.)\s+\S", notes, re.MULTILINE)
+        )
+        if blocks >= 3:
+            out.append(Result("A", "A5", OK, f"у docs/ci.md розібрано пунктів: {blocks}"))
+        else:
+            out.append(
+                Result("A", "A5", FAIL, f"у docs/ci.md {blocks} пунктів, а дефектів було три")
+            )
+
+    readme = repo.read("README.md") or ""
+    if BADGE.search(readme):
+        out.append(Result("A", "A6", OK, "у README є бейдж статусу пайплайна"))
+    else:
+        out.append(Result("A", "A6", FAIL, "у README немає бейджа статусу пайплайна"))
+
+    out.extend(check_lr4_pipeline(repo))
+    return out
+
+
+def yaml_top_blocks(text: str) -> dict[str, str]:
+    """Розбиває YAML на блоки верхнього рівня. Повного розбору тут не треба, і
+    залежностей у скрипті немає навмисно."""
+    blocks: dict[str, str] = {}
+    current = None
+    lines: list[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^([A-Za-z_][\w-]*):", line)
+        if match:
+            if current:
+                blocks[current] = "\n".join(lines)
+            current = match.group(1)
+            lines = [line]
+        elif current:
+            lines.append(line)
+    if current:
+        blocks[current] = "\n".join(lines)
+    return blocks
+
+
+def yaml_jobs(text: str) -> dict[str, str]:
+    jobs_block = yaml_top_blocks(text).get("jobs", "")
+    out: dict[str, str] = {}
+    current = None
+    lines: list[str] = []
+    for line in jobs_block.splitlines()[1:]:
+        match = re.match(r"^  ([A-Za-z_][\w-]*):", line)
+        if match:
+            if current:
+                out[current] = "\n".join(lines)
+            current = match.group(1)
+            lines = [line]
+        elif current:
+            lines.append(line)
+    if current:
+        out[current] = "\n".join(lines)
+    return out
+
+
+def check_lr4_pipeline(repo: Repo) -> list[Result]:
+    """Три дефекти виклику, кожен окремим рядком: тригер, крок checkout,
+    замаскована помилка. Читається текст файла, бо стан у GitHub говорить лише
+    про останній прогін, а не про те, чому він такий."""
+    text = repo.read(CI_WORKFLOW)
+    if text is None:
+        return [
+            Result("B", code, FAIL, f"{CI_WORKFLOW} не знайдено") for code in ("B1", "B2", "B3")
+        ]
+
+    triggers = yaml_top_blocks(text).get("on", "")
+    if "pull_request" in triggers:
+        out = [Result("B", "B1", OK, "пайплайн запускається на pull request")]
+    else:
+        out = [
+            Result(
+                "B",
+                "B1",
+                FAIL,
+                "у ci.yml немає тригера pull_request: на pull request не запускається нічого, "
+                "тому і в required checks вибирати нема чого",
+            )
+        ]
+
+    jobs = yaml_jobs(text)
+    without = [name for name, block in jobs.items() if "actions/checkout" not in block]
+    if not jobs:
+        out.append(Result("B", "B2", FAIL, "у ci.yml не видно жодного job"))
+    elif without:
+        out.append(
+            Result(
+                "B",
+                "B2",
+                FAIL,
+                "немає кроку actions/checkout у job: " + ", ".join(sorted(without)),
+            )
+        )
+    else:
+        out.append(Result("B", "B2", OK, f"код забирається в кожному job: {len(jobs)}"))
+
+    if "continue-on-error" in text:
+        out.append(
+            Result(
+                "B",
+                "B3",
+                FAIL,
+                "у ci.yml лишився continue-on-error: провалений крок не робить перевірку "
+                "червоною, тому зелена галочка нічого не означає",
+            )
+        )
+    else:
+        out.append(Result("B", "B3", OK, "жоден крок не ховає власну помилку"))
+
+    return out
+
+
+def latest_run(repo: Repo, slug: str, workflow: str) -> dict | None:
+    data = repo.gh_json(f"repos/{slug}/actions/workflows/{workflow}/runs?per_page=1")
+    runs = (data or {}).get("workflow_runs") if isinstance(data, dict) else None
+    if not runs:
+        return None
+    return runs[0]
+
+
+def required_contexts(repo: Repo, slug: str) -> set[str] | None:
+    found = None
+    rules = repo.gh_json(f"repos/{slug}/rules/branches/main")
+    if isinstance(rules, list):
+        found = set()
+        for rule in rules:
+            if isinstance(rule, dict) and rule.get("type") == "required_status_checks":
+                checks = (rule.get("parameters") or {}).get("required_status_checks") or []
+                found |= {item.get("context", "") for item in checks if isinstance(item, dict)}
+    classic = repo.gh_json(f"repos/{slug}/branches/main/protection")
+    if isinstance(classic, dict):
+        contexts = (classic.get("required_status_checks") or {}).get("contexts") or []
+        found = (found or set()) | set(contexts)
+    return found
+
+
+def check_lr4_process(repo: Repo) -> list[Result]:
+    slug = repo.slug()
+    codes = ("B4", "B5", "B6", "C1")
+    if not repo.gh_available() or slug is None:
+        return [
+            Result("B" if code[0] == "B" else "C", code, SKIP, "потрібен gh і remote origin")
+            for code in codes
+        ]
+
+    out: list[Result] = []
+
+    run = latest_run(repo, slug, "ci.yml")
+    if run is None:
+        out.append(Result("B", "B4", FAIL, "жодного прогону ci.yml ще не було"))
+        out.append(Result("B", "B5", SKIP, "немає прогону, артефакти перевіряти нема де"))
+    elif run.get("conclusion") == "success":
+        number = run.get("run_number")
+        out.append(Result("B", "B4", OK, f"останній прогін ci.yml зелений (#{number})"))
+        out.append(coverage_artifact(repo, slug, run))
+    else:
+        state = run.get("conclusion") or run.get("status") or "невідомо"
+        out.append(Result("B", "B4", FAIL, f"останній прогін ci.yml: {state}"))
+        out.append(coverage_artifact(repo, slug, run))
+
+    mutants = latest_run(repo, slug, "mutants.yml")
+    if mutants is None:
+        out.append(Result("B", "B6", FAIL, "жодного прогону mutants.yml ще не було"))
+    elif mutants.get("conclusion") == "success":
+        out.append(Result("B", "B6", OK, "усі чотири публічні мутанти вбиті"))
+    else:
+        out.append(
+            Result(
+                "B",
+                "B6",
+                FAIL,
+                "останній прогін mutants.yml червоний: серед чотирьох публічних мутантів "
+                "хтось вижив, звіт у кроці «Прогін мутантів»",
+            )
+        )
+
+    contexts = required_contexts(repo, slug)
+    if contexts is None:
+        out.append(Result("C", "C1", SKIP, "не вдалося прочитати захист main"))
+    else:
+        missing = [name for name in REQUIRED_CONTEXTS if name not in contexts]
+        if not missing:
+            out.append(Result("C", "C1", OK, "required checks увімкнені: lint і test"))
+        elif contexts:
+            out.append(
+                Result(
+                    "C",
+                    "C1",
+                    FAIL,
+                    "серед required checks немає: "
+                    + ", ".join(missing)
+                    + f" (є: {', '.join(sorted(contexts))})",
+                )
+            )
+        else:
+            out.append(Result("C", "C1", FAIL, "required status checks на main не увімкнені"))
+
+    return out
+
+
+def coverage_artifact(repo: Repo, slug: str, run: dict) -> Result:
+    data = repo.gh_json(f"repos/{slug}/actions/runs/{run.get('id')}/artifacts")
+    items = (data or {}).get("artifacts") if isinstance(data, dict) else None
+    if items is None:
+        return Result("B", "B5", SKIP, "GitHub API не віддав список артефактів")
+    names = {item.get("name") for item in items if isinstance(item, dict)}
+    if COVERAGE_ARTIFACT in names:
+        return Result("B", "B5", OK, f"у прогоні є артефакт {COVERAGE_ARTIFACT}")
+    return Result(
+        "B",
+        "B5",
+        FAIL,
+        f"у прогоні немає артефакта {COVERAGE_ARTIFACT}: звіт покриття нікуди не зберігається",
+    )
+
+
+def run_lr4(repo: Repo, run_slow: bool) -> list[Result]:
+    return (
+        prefixed(run_lr1(repo, run_slow), "ЛР1")
+        + prefixed(check_lr2_files(repo) + check_lr2_process(repo), "ЛР2")
+        + prefixed(check_lr3_files(repo) + check_lr3_process(repo), "ЛР3")
+        + prefixed(check_lr4_tests(repo) + check_lr4_files(repo) + check_lr4_process(repo), "ЛР4")
+    )
+
+
+CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4}
 
 
 def render(results: list[Result], lr: int) -> str:
