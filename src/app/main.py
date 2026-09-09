@@ -7,7 +7,7 @@ from app.config import settings
 from app.models import Item, ItemCreate
 from app.storage import storage
 
-app = FastAPI(title=settings.app_name, version=__version__)
+app = FastAPI(title=settings.app_name, version=__version__, lifespan=settings.lifespan)
 
 print(f"Стартує {settings.app_name}, оточення {settings.app_env}")
 

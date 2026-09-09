@@ -5,6 +5,7 @@
 """
 
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -27,11 +28,28 @@ class Settings:
     log_level: str
     reload: bool
 
+    @asynccontextmanager
+    async def lifespan(self, app):
+        """Перевірка оточення на старті сервера.
+
+        Значення за замовчуванням для APP_ENV прибране навмисно: сервіс, який
+        тихо піднявся у продакшні як `local`, гірший за сервіс, який не піднявся
+        і сказав чому. Перевірка стоїть тут, а не при імпорті, бо тести
+        імпортують модуль без сервера, а сервер без оточення стартувати не
+        повинен.
+        """
+        if not self.app_env:
+            raise RuntimeError(
+                "Змінна оточення APP_ENV не задана. Сервіс не стартує без неї: "
+                "задайте APP_ENV в оточенні контейнера, наприклад APP_ENV=local."
+            )
+        yield
+
 
 def load_settings() -> Settings:
     return Settings(
         app_name=_env("APP_NAME", "Starter Service"),
-        app_env=_env("APP_ENV", "local"),
+        app_env=_env("APP_ENV", ""),
         host=_env("APP_HOST", "127.0.0.1"),
         port=int(_env("APP_PORT", "8000")),
         log_level=_env("APP_LOG_LEVEL", "info"),
