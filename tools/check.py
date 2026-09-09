@@ -20,6 +20,7 @@
     python tools/check.py --lr 1          конкретна робота
     python tools/check.py --repo ../inshe  інший каталог
     python tools/check.py --summary out.md звіт у файл, для GitHub Actions
+    python tools/check.py --image       зібрати образ і підняти сервіс з README, з ЛР6
 
 Залежностей немає навмисно: тільки стандартна бібліотека, щоб скрипт запускався
 там, де більше нічого не поставлено. Перевірки, які потребують GitHub API,
@@ -34,6 +35,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1680,7 +1682,696 @@ def run_lr5(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
-CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4, 5: run_lr5}
+# --------------------------------------------------------------------------- #
+# ЛР6. Реліз: контейнер, версія, changelog, відкат
+# --------------------------------------------------------------------------- #
+#
+# Правила дивляться на три речі: чи добудований образ і його пайплайн, чи існує
+# реліз як версія (анотований тег, GitHub Release, публічний пакет у GHCR), і чи
+# стався відкат після релізу, а не до нього. Запуск образу це повільна перевірка,
+# тому вона живе за прапорцем --image і ганяється викладачем після дедлайну і
+# перед екзаменом, а не в пайплайні студента на кожен push.
+
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
+ROLLBACK_DOC = "docs/rollback.md"
+FIRST_TAG = "v0.1.0"
+BROKEN_TAG = "v0.1.1"
+REGISTRY_URL = os.environ.get("COURSE_REGISTRY_URL", "https://ghcr.io")
+CHANGELOG_TYPES = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
+CHANGELOG_VERSION = re.compile(r"^## \[(\d+\.\d+\.\d+)\]\s*-\s*(\d{4}-\d{2}-\d{2})")
+DOCKER_RUN = re.compile(
+    r"^[ \t]*(?:\$[ \t]*)?(docker[ \t]+run\b[^\n]*?ghcr\.io/([\w.-]+/[\w.-]+):([\w.-]+)[^\n]*)$",
+    re.MULTILINE,
+)
+MINUTES = re.compile(r"\b\d+\s*(?:хв\b|хвилин|min\b)", re.IGNORECASE)
+MANIFEST_TYPES = (
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+)
+OPTIONS = {"image": False}
+
+
+def dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """Інструкції Dockerfile як пари (назва, аргументи). Коментарі відкинуті,
+    рядки, з'єднані зворотним слешем, зібрані в один."""
+    out: list[tuple[str, str]] = []
+    pending: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        continued = line.endswith("\\")
+        pending.append(line.rstrip("\\").strip())
+        if continued:
+            continue
+        name, _, rest = " ".join(pending).partition(" ")
+        out.append((name.upper(), rest.strip()))
+        pending = []
+    if pending:
+        name, _, rest = " ".join(pending).partition(" ")
+        out.append((name.upper(), rest.strip()))
+    return out
+
+
+def changelog_sections(text: str) -> dict[str, str]:
+    """Розділи версій у CHANGELOG.md: номер версії і текст до наступного розділу.
+    Розділ рахується лише з датою у форматі РРРР-ММ-ДД, як вимагає Keep a Changelog."""
+    sections: dict[str, str] = {}
+    current = None
+    body: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if current:
+                sections[current] = "\n".join(body)
+            match = CHANGELOG_VERSION.match(line)
+            current = match.group(1) if match else None
+            body = []
+        elif current:
+            body.append(line)
+    if current:
+        sections[current] = "\n".join(body)
+    return sections
+
+
+def changelog_section_problems(sections: dict[str, str], version: str) -> str | None:
+    if version not in sections:
+        return f"немає розділу [{version}] з датою у форматі РРРР-ММ-ДД"
+    body = sections[version]
+    if not any(re.search(rf"^### {kind}\b", body, re.MULTILINE) for kind in CHANGELOG_TYPES):
+        return f"у розділі [{version}] немає підрозділу з типом зміни: " + ", ".join(
+            CHANGELOG_TYPES
+        )
+    if not re.search(r"^\s*[-*] \S", body, re.MULTILINE):
+        return f"у розділі [{version}] немає жодного пункту"
+    return None
+
+
+def readme_run_command(repo: Repo) -> re.Match | None:
+    return DOCKER_RUN.search(repo.read("README.md") or "")
+
+
+def check_lr6_dockerfile(repo: Repo) -> list[Result]:
+    text = repo.read("Dockerfile")
+    if text is None:
+        return [Result("A", code, FAIL, "Dockerfile не знайдено") for code in ("A1", "A2", "A3")]
+    out: list[Result] = []
+
+    leftovers = []
+    if re.search(r"\bTODO\b", text):
+        leftovers.append("позначки TODO")
+    if re.search(r"\bexit\s+1\b", text):
+        leftovers.append("рядок exit 1")
+    if leftovers:
+        out.append(
+            Result(
+                "A",
+                "A1",
+                FAIL,
+                "у Dockerfile лишились " + " і ".join(leftovers) + ": заготовка не добудована",
+            )
+        )
+    else:
+        out.append(Result("A", "A1", OK, "заготовка Dockerfile добудована"))
+
+    steps = dockerfile_instructions(text)
+    install_at = next(
+        (i for i, (name, args) in enumerate(steps) if name == "RUN" and "install" in args), None
+    )
+    copies = [i for i, (name, _) in enumerate(steps) if name in ("COPY", "ADD")]
+    if install_at is None:
+        out.append(Result("A", "A2", FAIL, "у Dockerfile немає RUN, який ставить залежності"))
+    elif not copies:
+        out.append(Result("A", "A2", FAIL, "у Dockerfile немає COPY: код в образ не потрапляє"))
+    elif copies[-1] > install_at:
+        out.append(Result("A", "A2", OK, "залежності ставляться до копіювання коду, шар кешується"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A2",
+                FAIL,
+                "код копіюється до встановлення залежностей: кожна зміна коду "
+                "перезбирає шар із залежностями з нуля",
+            )
+        )
+
+    users = [args for name, args in steps if name == "USER"]
+    missing = []
+    if not users or users[-1].split(":")[0].strip() in ("root", "0"):
+        missing.append("USER не root")
+    if not any(name == "EXPOSE" for name, _ in steps):
+        missing.append("EXPOSE")
+    if not any(name in ("CMD", "ENTRYPOINT") for name, _ in steps):
+        missing.append("CMD або ENTRYPOINT")
+    if missing:
+        out.append(Result("A", "A3", FAIL, "у Dockerfile бракує: " + ", ".join(missing)))
+    else:
+        out.append(Result("A", "A3", OK, "процес не від root, порт оголошений, команда запуску є"))
+    return out
+
+
+def check_lr6_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    workflow = repo.read(RELEASE_WORKFLOW)
+    if workflow is None:
+        out.append(Result("A", "A4", FAIL, f"{RELEASE_WORKFLOW} не знайдено"))
+    else:
+        blocks = yaml_top_blocks(workflow)
+        problems = []
+        triggers = blocks.get("on", "") + blocks.get("true", "")
+        if "tags" not in triggers:
+            problems.append("немає тригера на теги (on: push: tags)")
+        if "ghcr.io" not in workflow:
+            problems.append("образ не йде в ghcr.io")
+        permissions = blocks.get("permissions") or workflow
+        if "write-all" in permissions:
+            problems.append(
+                "permissions: write-all, а потрібні рівно ті права, що використовуються"
+            )
+        elif not re.search(r"packages:\s*write", permissions):
+            problems.append("у permissions немає packages: write")
+        if problems:
+            out.append(Result("A", "A4", FAIL, "release.yml: " + "; ".join(problems)))
+        else:
+            out.append(
+                Result(
+                    "A", "A4", OK, "release.yml: тег запускає збірку, образ іде в GHCR, права явні"
+                )
+            )
+
+    changelog = repo.read("CHANGELOG.md")
+    if changelog is None:
+        out.append(Result("A", "A5", FAIL, "CHANGELOG.md не знайдено"))
+    else:
+        problems = []
+        if not re.search(r"^## \[Unreleased\]", changelog, re.MULTILINE | re.IGNORECASE):
+            problems.append("немає розділу [Unreleased]")
+        problem = changelog_section_problems(changelog_sections(changelog), "0.1.0")
+        if problem:
+            problems.append(problem)
+        if problems:
+            out.append(Result("A", "A5", FAIL, "CHANGELOG.md: " + "; ".join(problems)))
+        else:
+            out.append(Result("A", "A5", OK, "CHANGELOG.md за Keep a Changelog, розділ 0.1.0 є"))
+
+    rollback = repo.read(ROLLBACK_DOC)
+    if rollback is None:
+        out.append(Result("A", "A6", FAIL, f"{ROLLBACK_DOC} не знайдено"))
+    else:
+        missing = []
+        if "docker run" not in rollback:
+            missing.append("команда docker run")
+        for tag in (BROKEN_TAG, FIRST_TAG):
+            if tag not in rollback:
+                missing.append(f"згадка {tag}")
+        if "APP_ENV" not in rollback:
+            missing.append("рядок логу з причиною падіння")
+        if not MINUTES.search(rollback):
+            missing.append("час відкату в хвилинах")
+        if not re.search(r"інакше", rollback, re.IGNORECASE):
+            missing.append("що зробили б інакше")
+        if missing:
+            out.append(Result("A", "A6", FAIL, "у docs/rollback.md бракує: " + ", ".join(missing)))
+        else:
+            out.append(
+                Result("A", "A6", OK, "docs/rollback.md: команди, лог, час і висновок на місці")
+            )
+
+    readme = repo.read("README.md") or ""
+    found = DOCKER_RUN.search(readme)
+    slug = repo.slug()
+    if found is None:
+        hint = " (образ згаданий, але без тега версії)" if "ghcr.io/" in readme else ""
+        out.append(
+            Result(
+                "A",
+                "A7",
+                FAIL,
+                "у README немає команди docker run з образом ghcr.io/…:тег, "
+                "тобто запуску з релізу однією командою" + hint,
+            )
+        )
+    elif slug and found.group(2).lower() != slug.lower():
+        out.append(
+            Result(
+                "A",
+                "A7",
+                FAIL,
+                f"команда в README запускає {found.group(2)}, а репозиторій це {slug}",
+            )
+        )
+    else:
+        out.append(
+            Result("A", "A7", OK, f"README запускає з релізу: {found.group(2)}:{found.group(3)}")
+        )
+
+    ci = repo.read(CI_WORKFLOW) or ""
+    if "make build" in ci:
+        out.append(Result("A", "A8", OK, "у ci.yml є крок make build"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A8",
+                FAIL,
+                "у ci.yml немає кроку make build: складання образу мало приїхати в job build",
+            )
+        )
+    return out
+
+
+def tag_info(repo: Repo, name: str) -> dict | None:
+    """Тег локально або, якщо клон без тегів, через GitHub API."""
+    done = repo.run(["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{name}^{{commit}}"])
+    if done.returncode == 0:
+        commit = done.stdout.strip()
+        kind = repo.run(["git", "cat-file", "-t", name]).stdout.strip()
+        when = repo.run(
+            ["git", "for-each-ref", "--format=%(taggerdate:unix)", f"refs/tags/{name}"]
+        ).stdout.strip()
+        if not when:
+            when = repo.run(["git", "log", "-1", "--format=%ct", commit]).stdout.strip()
+        return {
+            "commit": commit,
+            "annotated": kind == "tag",
+            "time": int(when) if when.isdigit() else None,
+            "local": True,
+        }
+    slug = repo.slug()
+    if slug and repo.gh_available():
+        ref = repo.gh_json(f"repos/{slug}/git/ref/tags/{name}")
+        if isinstance(ref, dict):
+            kind = (ref.get("object") or {}).get("type")
+            return {"commit": None, "annotated": kind == "tag", "time": None, "local": False}
+    return None
+
+
+def registry_manifest(path: str, tag: str) -> int | None:
+    """HTTP-код відповіді реєстру на маніфест образу. Публічний пакет віддає 200
+    без жодної авторизації, приватний або відсутній дає 401, 403 або 404. None,
+    якщо реєстр недосяжний."""
+    base = REGISTRY_URL.rstrip("/")
+    headers = {"Accept": ", ".join(MANIFEST_TYPES)}
+    try:
+        with urllib.request.urlopen(
+            f"{base}/token?scope=repository:{path}:pull", timeout=15
+        ) as response:
+            token = json.loads(response.read().decode("utf-8")).get("token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    except (urllib.error.URLError, ValueError, OSError):
+        pass
+    request = urllib.request.Request(f"{base}/v2/{path}/manifests/{tag}", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except (urllib.error.URLError, OSError):
+        return None
+
+
+def check_lr6_release(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    first = tag_info(repo, FIRST_TAG)
+    if first is None:
+        out.append(
+            Result(
+                "B",
+                "B1",
+                FAIL,
+                f"тега {FIRST_TAG} немає: реліз починається з анотованого тега на main",
+            )
+        )
+    elif not first["annotated"]:
+        out.append(
+            Result(
+                "B",
+                "B1",
+                WARN,
+                f"тег {FIRST_TAG} легкий, а не анотований: наступний ставте через git tag -a",
+            )
+        )
+    else:
+        out.append(Result("B", "B1", OK, f"тег {FIRST_TAG} є і анотований"))
+
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        out.append(Result("B", "B2", SKIP, "потрібен gh і remote origin"))
+    else:
+        release = repo.gh_json(f"repos/{slug}/releases/tags/{FIRST_TAG}")
+        body = (release.get("body") or "").strip() if isinstance(release, dict) else ""
+        if not isinstance(release, dict):
+            out.append(
+                Result(
+                    "B",
+                    "B2",
+                    FAIL,
+                    f"GitHub Release {FIRST_TAG} немає: release.yml має створювати його "
+                    "з розділу версії в CHANGELOG.md",
+                )
+            )
+        elif release.get("draft"):
+            out.append(Result("B", "B2", FAIL, f"GitHub Release {FIRST_TAG} лишився чернеткою"))
+        elif len(body) < 40:
+            out.append(
+                Result(
+                    "B",
+                    "B2",
+                    FAIL,
+                    f"у GitHub Release {FIRST_TAG} порожні release notes: туди має потрапити "
+                    "розділ версії з CHANGELOG.md",
+                )
+            )
+        else:
+            out.append(
+                Result(
+                    "B",
+                    "B2",
+                    OK,
+                    f"GitHub Release {FIRST_TAG} є, release notes {len(body)} символів",
+                )
+            )
+
+    found = readme_run_command(repo)
+    tag = found.group(3) if found else FIRST_TAG
+    if slug is None:
+        out.append(Result("B", "B3", SKIP, "без remote origin невідомо, який пакет шукати"))
+    else:
+        path = slug.lower()
+        status = registry_manifest(path, tag)
+        if status is None:
+            out.append(Result("B", "B3", SKIP, "реєстр образів недосяжний"))
+        elif status == 200:
+            out.append(
+                Result("B", "B3", OK, f"образ {path}:{tag} доступний у реєстрі без авторизації")
+            )
+        elif status in (401, 403):
+            out.append(
+                Result(
+                    "B",
+                    "B3",
+                    FAIL,
+                    f"образ {path}:{tag} не віддається анонімно: пакет приватний або його немає. "
+                    "Packages, Package settings, Change visibility, Public",
+                )
+            )
+        elif status == 404:
+            out.append(
+                Result(
+                    "B",
+                    "B3",
+                    FAIL,
+                    f"образу {path}:{tag} у реєстрі немає: release.yml має запушити його на тег",
+                )
+            )
+        else:
+            out.append(Result("B", "B3", SKIP, f"реєстр відповів кодом {status}"))
+
+    if not repo.gh_available() or slug is None:
+        out.append(Result("B", "B4", SKIP, "потрібен gh і remote origin"))
+    else:
+        run = latest_run(repo, slug, "release.yml")
+        if run is None:
+            out.append(
+                Result(
+                    "B",
+                    "B4",
+                    FAIL,
+                    "release.yml ще жодного разу не запускався: його запускає push тега",
+                )
+            )
+        elif run.get("conclusion") == "success":
+            out.append(
+                Result(
+                    "B",
+                    "B4",
+                    OK,
+                    f"останній прогін release.yml зелений (#{run.get('run_number')}, "
+                    f"{run.get('head_branch')})",
+                )
+            )
+        else:
+            state = run.get("conclusion") or run.get("status") or "невідомо"
+            out.append(Result("B", "B4", FAIL, f"останній прогін release.yml: {state}"))
+    return out
+
+
+def docker_available(repo: Repo) -> bool:
+    try:
+        return repo.run(["docker", "info"], timeout=60).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def run_release_image(repo: Repo) -> Result:
+    """Запускає сервіс тією командою, яку README дає людині, і чекає /health.
+    Саме так образ піднімається на екзамені, тому команда береться з README
+    дослівно, а не збирається з окремих полів."""
+    found = readme_run_command(repo)
+    if found is None:
+        return Result("B", "B6", FAIL, "у README немає команди запуску з образу, дивіться A7")
+    command, image, tag = found.group(1), found.group(2), found.group(3)
+    try:
+        parts = shlex.split(command)
+    except ValueError as error:
+        return Result("B", "B6", FAIL, f"команду з README не вдалося розібрати: {error}")
+
+    args = parts[2:]
+    cleaned: list[str] = []
+    port = None
+    index = 0
+    while index < len(args):
+        item = args[index]
+        mapping = None
+        if item in ("--rm", "-it", "-i", "-t", "-d", "--detach"):
+            index += 1
+            continue
+        if item in ("-p", "--publish") and index + 1 < len(args):
+            mapping = args[index + 1]
+            cleaned.extend([item, mapping])
+            index += 2
+        elif item.startswith("--publish="):
+            mapping = item.split("=", 1)[1]
+            cleaned.append(item)
+            index += 1
+        elif item.startswith("-p") and len(item) > 2:
+            mapping = item[2:]
+            cleaned.append(item)
+            index += 1
+        else:
+            cleaned.append(item)
+            index += 1
+        if mapping:
+            segments = mapping.split(":")
+            if len(segments) >= 2 and segments[-2].isdigit():
+                port = int(segments[-2])
+    if port is None:
+        return Result(
+            "B",
+            "B6",
+            FAIL,
+            "команда в README не публікує порт (-p хост:контейнер), сервіс буде недосяжний",
+        )
+
+    name = f"course-check-{os.getpid()}"
+    try:
+        started = repo.run(["docker", "run", "-d", "--name", name] + cleaned, timeout=600)
+    except subprocess.TimeoutExpired:
+        return Result("B", "B6", FAIL, f"docker run {image}:{tag} не завершився за 10 хвилин")
+    if started.returncode != 0:
+        tail = (started.stdout + started.stderr).strip().splitlines()[-2:]
+        return Result("B", "B6", FAIL, "docker run не вдався: " + " / ".join(tail))
+    try:
+        for _ in range(60):
+            time.sleep(1)
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=2
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError):
+                state = repo.run(["docker", "inspect", "-f", "{{.State.Status}}", name]).stdout
+                if state.strip() == "exited":
+                    logs = repo.run(["docker", "logs", "--tail", "3", name])
+                    tail = (logs.stdout + logs.stderr).strip().splitlines()[-2:]
+                    return Result(
+                        "B",
+                        "B6",
+                        FAIL,
+                        f"контейнер {image}:{tag} завершився, не піднявши сервіс: "
+                        + " / ".join(tail),
+                    )
+                continue
+            if payload.get("status") != "ok":
+                return Result("B", "B6", FAIL, f"/health відповів, але не ok: {payload}")
+            version = str(payload.get("version") or "")
+            if version and version != tag.lstrip("v"):
+                return Result(
+                    "B",
+                    "B6",
+                    WARN,
+                    f"сервіс піднявся з {image}:{tag}, але /health каже версію {version}: "
+                    "підіймайте __version__ разом із тегом",
+                )
+            return Result(
+                "B", "B6", OK, f"сервіс піднявся з образу {image}:{tag}, /health віддає ok"
+            )
+        return Result(
+            "B", "B6", FAIL, f"сервіс з {image}:{tag} не відповів на /health за 60 секунд"
+        )
+    finally:
+        repo.run(["docker", "rm", "-f", name], timeout=60)
+
+
+def check_lr6_image(repo: Repo) -> list[Result]:
+    if not OPTIONS["image"]:
+        return [
+            Result("B", "B5", SKIP, "make build не запускався: додайте --image"),
+            Result("B", "B6", SKIP, "образ з README не запускався: додайте --image"),
+        ]
+    if not docker_available(repo):
+        return [
+            Result("B", "B5", SKIP, "docker недоступний, make build не запускався"),
+            Result("B", "B6", SKIP, "docker недоступний, образ не запускався"),
+        ]
+    out: list[Result] = []
+    try:
+        done = repo.run(["make", "build"], timeout=900)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        out.append(Result("B", "B5", FAIL, f"make build не вдалося запустити: {error}"))
+    else:
+        if done.returncode == 0:
+            out.append(Result("B", "B5", OK, "make build зібрав образ"))
+        else:
+            tail = (done.stdout + done.stderr).strip().splitlines()[-3:]
+            out.append(Result("B", "B5", FAIL, "make build червоний: " + " / ".join(tail)))
+    out.append(run_release_image(repo))
+    return out
+
+
+def check_lr6_process(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    broken = tag_info(repo, BROKEN_TAG)
+    if broken is None:
+        out.append(
+            Result(
+                "C",
+                "C1",
+                FAIL,
+                f"тега {BROKEN_TAG} немає: зміна курсу має пройти через pull request у main "
+                "і стати релізом 0.1.1",
+            )
+        )
+    elif not broken["local"]:
+        out.append(Result("C", "C1", SKIP, f"тег {BROKEN_TAG} є на GitHub, але не в клоні"))
+    else:
+        shown = repo.run(["git", "show", f"{BROKEN_TAG}:src/app/config.py"])
+        code = shown.stdout if shown.returncode == 0 else ""
+        if "APP_ENV" in code and "RuntimeError" in code:
+            out.append(Result("C", "C1", OK, f"у {BROKEN_TAG} сервіс вимагає APP_ENV на старті"))
+        else:
+            out.append(
+                Result(
+                    "C",
+                    "C1",
+                    FAIL,
+                    f"у коді за тегом {BROKEN_TAG} немає зміни курсу: cherry-pick з "
+                    "course/challenge/lr06 туди не доїхав",
+                )
+            )
+
+    changelog = repo.read("CHANGELOG.md") or ""
+    problem = changelog_section_problems(changelog_sections(changelog), "0.1.1")
+    if problem:
+        out.append(
+            Result(
+                "C", "C2", FAIL, f"CHANGELOG.md: {problem}. Реліз, який відкотили, теж має запис"
+            )
+        )
+    else:
+        out.append(Result("C", "C2", OK, "у CHANGELOG.md є розділ 0.1.1"))
+
+    ref = main_ref(repo)
+    first = tag_info(repo, FIRST_TAG)
+    local = [
+        (name, info)
+        for name, info in ((FIRST_TAG, first), (BROKEN_TAG, broken))
+        if info and info["local"]
+    ]
+    if ref is None or not local:
+        out.append(
+            Result(
+                "C", "C3", SKIP, "тегів у локальному клоні немає, належність до main не перевірити"
+            )
+        )
+    else:
+        off = [
+            name
+            for name, info in local
+            if repo.run(["git", "merge-base", "--is-ancestor", info["commit"], ref]).returncode != 0
+        ]
+        if off:
+            out.append(
+                Result(
+                    "C",
+                    "C3",
+                    FAIL,
+                    "теги стоять не на main: " + ", ".join(off) + ". Реліз ставиться на main "
+                    "після злиття pull request, а не на гілку",
+                )
+            )
+        else:
+            out.append(Result("C", "C3", OK, "теги стоять на комітах main"))
+
+    if ref is None or broken is None or not broken["local"] or broken["time"] is None:
+        out.append(Result("C", "C4", SKIP, f"без тега {BROKEN_TAG} у клоні час відкату не звірити"))
+    else:
+        when = repo.run(
+            ["git", "log", "-1", "--format=%ct", ref, "--", ROLLBACK_DOC]
+        ).stdout.strip()
+        if not when.isdigit():
+            out.append(Result("C", "C4", FAIL, f"{ROLLBACK_DOC} немає в історії main"))
+        elif int(when) > broken["time"]:
+            out.append(Result("C", "C4", OK, f"{ROLLBACK_DOC} записаний після релізу {BROKEN_TAG}"))
+        else:
+            out.append(
+                Result(
+                    "C",
+                    "C4",
+                    FAIL,
+                    f"{ROLLBACK_DOC} старіший за тег {BROKEN_TAG}: відкат не може статися "
+                    "раніше за реліз, який відкочують",
+                )
+            )
+    return out
+
+
+def run_lr6(repo: Repo, run_slow: bool) -> list[Result]:
+    # ЛР1.B4 обіцяв, що make build запрацює після ЛР6, і тепер його місце займає
+    # ЛР6.B5. Рядок LATER про CHANGELOG.md теж зайвий: за нього відповідає ЛР6.A5.
+    base = [
+        item
+        for item in run_lr5(repo, run_slow)
+        if item.code != "ЛР1.B4"
+        and not (item.code == "ЛР1.A11" and item.message.startswith("CHANGELOG.md"))
+    ]
+    return base + prefixed(
+        check_lr6_dockerfile(repo)
+        + check_lr6_files(repo)
+        + check_lr6_release(repo)
+        + check_lr6_image(repo)
+        + check_lr6_process(repo),
+        "ЛР6",
+    )
+
+
+CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4, 5: run_lr5, 6: run_lr6}
 
 
 def render(results: list[Result], lr: int) -> str:
@@ -1726,8 +2417,7 @@ def rotation_lines(repo: Repo) -> list[str]:
         ]
     fallback = table.get("fallback", {})
     repos = {
-        item.get("github", "").lower(): item.get("repo", "")
-        for item in table.get("students", [])
+        item.get("github", "").lower(): item.get("repo", "") for item in table.get("students", [])
     }
     titles = {
         "lr03": "ЛР3, рев'ю pull request",
@@ -1765,6 +2455,11 @@ def main() -> int:
     parser.add_argument(
         "--slow", action="store_true", help="запускати make test, make lint і сервіс"
     )
+    parser.add_argument(
+        "--image",
+        action="store_true",
+        help="зібрати образ і запустити сервіс командою з README, з ЛР6 (повільно, для викладача)",
+    )
     parser.add_argument("--summary", help="записати звіт у файл")
     parser.add_argument(
         "--strict", action="store_true", help="повернути код 1, якщо є хоч один FAIL"
@@ -1776,6 +2471,8 @@ def main() -> int:
 
     if args.who:
         return show_rotation(Repo(Path(args.repo)))
+
+    OPTIONS["image"] = args.image
 
     lr = args.lr or int(course_config().get("current_lr", 1))
     if lr not in CHECKS:
