@@ -1,0 +1,48 @@
+# Рахунок мутантів курсу. Ганяється на кожен push і руками з вкладки Actions.
+#
+# Мутант це повна самодостатня реалізація `legacy/pricing.py` з однією зміненою
+# поведінкою. Скрипт підміняє модуль по черзі кожним мутантом, ганяє ваші тести
+# і повертає файл на місце. Мутант вбитий, коли хоча б один тест упав.
+#
+# Тут лежать чотири мутанти з восьми. Решту чотири викладач проганяє тим самим
+# скриптом при оцінюванні, тому писати тести під відомий список немає сенсу.
+#
+# Ця перевірка не входить у required status checks і злиття не блокує.
+
+name: Мутанти курсу
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрати код
+        uses: actions/checkout@v7
+
+      - name: Поставити Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Поставити залежності
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Забрати мутантів курсу
+        run: |
+          BASE=https://raw.githubusercontent.com/LyahovchukSergiy/engineering-culture-2026-template/refs/heads/challenge/lr04/mutants
+          mkdir -p .course-mutants
+          for name in run_mutants.py m1.py m2.py m3.py m4.py; do
+            curl -fsSL "$BASE/$name" -o ".course-mutants/$name"
+          done
+
+      - name: Прогін мутантів
+        run: python .course-mutants/run_mutants.py --mutants .course-mutants
