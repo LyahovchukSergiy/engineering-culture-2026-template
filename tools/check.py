@@ -1441,7 +1441,246 @@ def run_lr4(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
-CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4}
+# --------------------------------------------------------------------------- #
+# ЛР5. Проміжна контрольна точка
+# --------------------------------------------------------------------------- #
+#
+# Нових артефактів ЛР5 не додає, тому правил тут мало і кожне відповідає рядку
+# рубрики. Перший рядок рубрики, «валідатор зелений», окремого правила не має
+# навмисно: це весь звіт вище, тобто відсутність FAIL за ЛР1-ЛР4.
+
+SCREENCAST_MARK = re.compile(r"\bЛР\s?0?5\b|\bLR\s?0?5\b|скринкаст", re.IGNORECASE)
+LINK = re.compile(r"https?://\S+")
+BRANCH_PREFIX = re.compile(r"\b([a-z][a-z0-9._-]{1,20})/")
+COMMIT_TYPES = (
+    "feat",
+    "fix",
+    "docs",
+    "style",
+    "refactor",
+    "perf",
+    "test",
+    "build",
+    "ci",
+    "chore",
+    "revert",
+)
+COMMIT_TYPE_IN_TEXT = re.compile(r"\b(" + "|".join(COMMIT_TYPES) + r")\b", re.IGNORECASE)
+COMMIT_TYPE_IN_SUBJECT = re.compile(r"^([a-z]+)(?:\([^)]+\))?!?: ")
+
+
+def section_text(text: str, heading_pattern: str) -> str | None:
+    """Тіло розділу, знайденого за заголовком. None, якщо розділу немає.
+
+    Відрізняється від section_items тим, що віддає весь текст, а не тільки
+    елементи списку: угода про гілки і коміти пишеться прозою.
+    """
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#") and re.search(heading_pattern, line, re.IGNORECASE):
+            start = index + 1
+            break
+    if start is None:
+        return None
+    body = []
+    for line in lines[start:]:
+        if line.lstrip().startswith("#"):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def check_lr5_screencast(repo: Repo) -> list[Result]:
+    """Рядок рубрики «показ проведено». Валідатор не дивиться відео, він знаходить
+    посилання і друкує його разом із датою, щоб пакетний прогін по підгрупі одразу
+    давав список того, що треба подивитись."""
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [Result("A", "A1", SKIP, "потрібен gh і remote origin")]
+
+    raw = repo.gh_json(f"repos/{slug}/issues?state=all&per_page=100")
+    if raw is None:
+        return [Result("A", "A1", SKIP, "GitHub API не віддав issue")]
+
+    owner = slug.split("/")[0]
+    found = []
+    for item in raw:
+        if "pull_request" in item or (item.get("user") or {}).get("login") != owner:
+            continue
+        title = item.get("title") or ""
+        body = item.get("body") or ""
+        if not SCREENCAST_MARK.search(title) and not SCREENCAST_MARK.search(body):
+            continue
+        link = LINK.search(body) or LINK.search(title)
+        if link:
+            found.append((item, link.group(0)))
+
+    if not found:
+        return [
+            Result(
+                "A",
+                "A1",
+                FAIL,
+                "немає issue зі скринкастом: потрібна власна issue, у назві якої є ЛР5, "
+                "а в тілі посилання на п'ятихвилинний запис",
+            )
+        ]
+
+    item, link = max(found, key=lambda pair: pair[0].get("created_at") or "")
+    when = (item.get("created_at") or "")[:10]
+    return [Result("A", "A1", OK, f"скринкаст: {link} (issue #{item.get('number')}, {when})")]
+
+
+def check_lr5_pipeline(repo: Repo) -> list[Result]:
+    """Рядок рубрики «пайплайн зелений». ЛР4 дивиться на останній прогін де завгодно,
+    тому зеленою може бути гілка, а main лишатись червоним. Контрольна точка питає
+    саме про main."""
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [Result("B", code, SKIP, "потрібен gh і remote origin") for code in ("B1", "B2")]
+
+    out: list[Result] = []
+    for code, workflow, title in (
+        ("B1", "ci.yml", "пайплайн"),
+        ("B2", "mutants.yml", "прогін мутантів"),
+    ):
+        data = repo.gh_json(
+            f"repos/{slug}/actions/workflows/{workflow}/runs?branch=main&per_page=1"
+        )
+        runs = (data or {}).get("workflow_runs") if isinstance(data, dict) else None
+        if runs is None:
+            out.append(Result("B", code, SKIP, f"GitHub API не віддав прогони {workflow}"))
+        elif not runs:
+            out.append(
+                Result("B", code, FAIL, f"{workflow} жодного разу не відпрацював на main")
+            )
+        elif runs[0].get("conclusion") == "success":
+            number = runs[0].get("run_number")
+            out.append(Result("B", code, OK, f"на main {title} зелений (#{number})"))
+        else:
+            state = runs[0].get("conclusion") or runs[0].get("status") or "невідомо"
+            out.append(Result("B", code, FAIL, f"на main {workflow}: {state}"))
+    return out
+
+
+def check_lr5_agreement(repo: Repo) -> list[Result]:
+    """Рядок рубрики «історія відповідає власному CONTRIBUTING.md».
+
+    Правило звіряє історію не із загальним ідеалом, а з тим, що студент сам
+    написав на ЛР1. Тому воно однаково закривається двома способами: привести
+    історію до угоди або чесно переписати угоду під те, як робота йшла насправді.
+    """
+    contributing = repo.read("CONTRIBUTING.md")
+    if contributing is None:
+        return [
+            Result("C", code, FAIL, "CONTRIBUTING.md не знайдено, звіряти нема з чим")
+            for code in ("C1", "C2")
+        ]
+
+    slug = repo.slug()
+    out: list[Result] = []
+
+    branches = section_text(contributing, r"гілк")
+    declared = sorted({match.lower() for match in BRANCH_PREFIX.findall(branches or "")})
+    if branches is None:
+        out.append(Result("C", "C1", FAIL, "у CONTRIBUTING.md немає розділу про гілки"))
+    elif not declared:
+        out.append(
+            Result(
+                "C",
+                "C1",
+                FAIL,
+                "у розділі про гілки немає прикладу реального імені виду feat/щось, "
+                "тому звіряти історію нема з чим",
+            )
+        )
+    elif not repo.gh_available() or slug is None:
+        out.append(Result("C", "C1", SKIP, "потрібен gh і remote origin"))
+    else:
+        pulls = repo.gh_json(f"repos/{slug}/pulls?state=closed&per_page=100")
+        if pulls is None:
+            out.append(Result("C", "C1", SKIP, "GitHub API не віддав pull request"))
+        else:
+            used = [
+                (item.get("head") or {}).get("ref", "")
+                for item in pulls
+                if item.get("merged_at") and (item.get("head") or {}).get("ref")
+            ]
+            odd = [name for name in used if not any(name.lower().startswith(p) for p in declared)]
+            shown = ", ".join(sorted(declared)[:5])
+            if not used:
+                out.append(Result("C", "C1", SKIP, "змержених pull request немає"))
+            elif len(odd) <= 1:
+                fit = len(used) - len(odd)
+                out.append(
+                    Result("C", "C1", OK, f"гілки за угодою ({shown}): {fit} з {len(used)}")
+                )
+            else:
+                out.append(
+                    Result(
+                        "C",
+                        "C1",
+                        FAIL,
+                        f"угода називає {shown}, а гілки інші: " + ", ".join(sorted(odd)[:5]),
+                    )
+                )
+
+    commits = section_text(contributing, r"коміт")
+    named = sorted({match.lower() for match in COMMIT_TYPE_IN_TEXT.findall(commits or "")})
+    if commits is None:
+        out.append(Result("C", "C2", FAIL, "у CONTRIBUTING.md немає розділу про коміти"))
+    elif not named:
+        out.append(
+            Result(
+                "C",
+                "C2",
+                FAIL,
+                "у розділі про коміти не названо жодного типу: перелічіть ті, "
+                "якими справді користуєтесь",
+            )
+        )
+    else:
+        ref = main_ref(repo)
+        log = repo.run(["git", "log", "--format=%s", "-30", ref]) if ref else None
+        subjects = log.stdout.splitlines() if log and log.returncode == 0 else []
+        used = set()
+        for line in subjects:
+            match = COMMIT_TYPE_IN_SUBJECT.match(line.strip())
+            if match and match.group(1).lower() in COMMIT_TYPES:
+                used.add(match.group(1).lower())
+        extra = sorted(used - set(named))
+        if not used:
+            out.append(Result("C", "C2", SKIP, "у main немає комітів за Conventional Commits"))
+        elif not extra:
+            out.append(
+                Result(
+                    "C",
+                    "C2",
+                    OK,
+                    "типи комітів у main усі названі в угоді: " + ", ".join(sorted(used)),
+                )
+            )
+        else:
+            out.append(
+                Result(
+                    "C",
+                    "C2",
+                    FAIL,
+                    f"в угоді названі {', '.join(named)}, а в main є ще: {', '.join(extra)}",
+                )
+            )
+
+    return out
+
+
+def run_lr5(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr4(repo, run_slow) + prefixed(
+        check_lr5_screencast(repo) + check_lr5_pipeline(repo) + check_lr5_agreement(repo), "ЛР5"
+    )
+
+
+CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4, 5: run_lr5}
 
 
 def render(results: list[Result], lr: int) -> str:
