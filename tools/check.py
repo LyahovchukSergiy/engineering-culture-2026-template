@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import re
@@ -162,6 +163,15 @@ class Repo:
             return None
         self._gh_cache[endpoint] = value
         return value
+
+    def gh_status(self, endpoint: str) -> int | None:
+        """HTTP-код відповіді без тіла: для ендпойнтів, де 204 і 404 це і є відповідь."""
+        try:
+            done = self.run(["gh", "api", "-i", "--silent", endpoint], timeout=60)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        match = re.search(r"HTTP/\S+\s+(\d{3})", done.stdout + done.stderr)
+        return int(match.group(1)) if match else None
 
     def text_files(self):
         for item in self.path.rglob("*"):
@@ -390,7 +400,14 @@ def check_b(repo: Repo, run_slow: bool) -> list[Result]:
 
 
 def health_check(repo: Repo) -> Result:
-    env = dict(os.environ, APP_HOST="127.0.0.1", APP_PORT="8099")
+    # APP_ENV задається явно: після виклику ЛР6 сервіс без цієї змінної не
+    # стартує, а в пайплайні .env немає. Значення з оточення викладача важливіше.
+    env = dict(
+        os.environ,
+        APP_HOST="127.0.0.1",
+        APP_PORT="8099",
+        APP_ENV=os.environ.get("APP_ENV") or "local",
+    )
     python = repo.path / ".venv" / "bin" / "python"
     interpreter = str(python) if python.exists() else sys.executable
     process = subprocess.Popen(
@@ -1095,6 +1112,7 @@ COURSE_OWNED_TESTS = {
     "tests/test_items.py",
     "tests/test_filter.py",
     "tests/test_sort.py",
+    "tests/test_summary.py",
 }
 
 BADGE = re.compile(r"actions/workflows/[\w.-]+/badge\.svg")
@@ -2371,7 +2389,733 @@ def run_lr6(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
-CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4, 5: run_lr5, 6: run_lr6}
+# --------------------------------------------------------------------------- #
+# ЛР7. Безпека коду і залежностей
+# --------------------------------------------------------------------------- #
+
+SECURITY_DOC = "docs/security.md"
+SECURITY_POLICY = "SECURITY.md"
+DEPENDABOT_CONFIG = ".github/dependabot.yml"
+KEY_NAME = "INTERNAL_API_KEY"
+SUMMARY_PATH = "/summary"
+CHALLENGE_PACKAGE = "jinja2"
+VULNERABLE_PIN = "3.1.5"
+SAFE_VERSION = (3, 1, 6)
+CHALLENGE_ADVISORY = ("CVE-2025-27516", "GHSA-cpwx-vrp4-4pq7")
+# Самого токена виклику тут немає: рядок із високою ентропією поруч зі словом
+# «token» спіймав би будь-який сканер, і студент, який створив репозиторій
+# пізніше за появу цих правил, отримав би знахідку у власному tools/check.py.
+# Зберігається лише SHA-256, а значення відновлюється з історії репозиторію.
+CHALLENGE_DIGEST = "2d98c125ac2caad811bc7d1446070d77a7073b2ed458261c3b6e1df38a0a4837"
+SECURITY_SECTIONS = (
+    ("модель загроз", r"загроз"),
+    ("витік токена", r"токен|секрет|витік"),
+    ("залежності", r"залежн|dependabot|вразлив"),
+    ("дані", r"дан(і|их)|знеособ|персональн"),
+    ("знахідка OWASP", r"owasp|знахідк"),
+)
+OWASP_CATEGORY = re.compile(r"\bA(?:0[1-9]|10)(?::2025)?\b")
+CODE_LINE_REF = re.compile(r"[\w./-]+\.py(?::\d+|#L\d+)|#L\d+")
+PR_REF = re.compile(r"(?:/pull/|#)(\d+)\b")
+COMMIT_HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
+CANDIDATE_SECRET = re.compile(r"\b[A-Za-z0-9]{40}\b")
+KEY_LITERAL = re.compile(rf"{KEY_NAME}\s*[:=]\s*[\"'][^\"'\n]{{16,}}[\"']")
+KEY_IMPORT = re.compile(rf"from\s+app\.\w+\s+import\s+[^\n]*\b{KEY_NAME}\b")
+SCANNER = re.compile(r"gitleaks|trufflehog", re.IGNORECASE)
+VERSION_SPEC = re.compile(
+    rf"^\s*[\"']?{CHALLENGE_PACKAGE}\s*(==|>=|~=|>)\s*(\d+(?:\.\d+)*)", re.IGNORECASE | re.MULTILINE
+)
+DEPENDABOT_BOT = "dependabot[bot]"
+
+
+def digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def challenge_token(repo: Repo) -> str | None:
+    """Значення токена виклику, відновлене з історії репозиторію.
+
+    Шукається по всіх гілках, включно з course/challenge/lr07 після fetch, тому
+    працює і до злиття виклику. Належність до main перевіряє окремо блок C.
+    """
+    shown = repo.run(
+        ["git", "log", "-p", "--all", f"-S{KEY_NAME}", "--format=", "--", "src", "tests"]
+    )
+    for candidate in set(CANDIDATE_SECRET.findall(shown.stdout)):
+        if digest(candidate) == CHALLENGE_DIGEST:
+            return candidate
+    return None
+
+
+HEADING = re.compile(r"^\s{0,3}(#{1,6})\s")
+
+
+def doc_section(text: str, heading_pattern: str) -> str | None:
+    """Тіло розділу разом з його підрозділами.
+
+    section_text зупиняється на будь-якому рядку з решітки, а docs/security.md
+    природно ділиться на підрозділи третього рівня і цитує вивід, де рядок
+    може починатись з «#1». Тут заголовок це решітки з пробілом поза блоком
+    коду, а розділ закінчується лише заголовком того самого або вищого рівня.
+    """
+    lines = text.splitlines()
+    start, level, fenced = None, 0, False
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            continue
+        found = None if fenced else HEADING.match(line)
+        if found and re.search(heading_pattern, line, re.IGNORECASE):
+            start, level = index + 1, len(found.group(1))
+            break
+    if start is None:
+        return None
+    body, fenced = [], False
+    for line in lines[start:]:
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced:
+            found = HEADING.match(line)
+            if found and len(found.group(1)) <= level:
+                break
+        body.append(line)
+    return "\n".join(body)
+
+
+def list_items(body: str) -> list[str]:
+    out = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+\.\s", stripped):
+            out.append(stripped)
+    return out
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in value.split("."))
+
+
+def manifest_problem(text: str | None, name: str, lock: bool) -> tuple[str, str] | None:
+    """(рівень, повідомлення) для маніфесту або None, якщо все гаразд."""
+    if text is None:
+        return FAIL, f"{name} не знайдено"
+    found = VERSION_SPEC.search(text)
+    if found is None:
+        if re.search(rf"\b{CHALLENGE_PACKAGE}\b", text, re.IGNORECASE):
+            return FAIL, f"у {name} {CHALLENGE_PACKAGE} без версії: закріпіть безпечну"
+        hint = ", образ упаде на імпорті" if lock else ": виклик не забрано"
+        return FAIL, f"у {name} немає {CHALLENGE_PACKAGE}{hint}"
+    operator, version = found.group(1), found.group(2)
+    if version_tuple(version) < SAFE_VERSION:
+        if operator == "==":
+            return FAIL, f"у {name} закріплена вразлива версія {CHALLENGE_PACKAGE}=={version}"
+        return (
+            WARN,
+            f"у {name} нижня межа {CHALLENGE_PACKAGE}{operator}{version} дозволяє вразливу версію",
+        )
+    if lock and operator != "==":
+        return WARN, f"{name} це lock-файл, версія має стояти через ==, а не {operator}"
+    return None
+
+
+def check_lr7_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+    token = challenge_token(repo)
+    doc = repo.read(SECURITY_DOC)
+    sections: dict[str, str] = {}
+
+    if doc is None:
+        out.append(Result("A", "A1", FAIL, f"{SECURITY_DOC} не знайдено"))
+        for code in ("A2", "A3", "A4", "A10", "A11"):
+            out.append(Result("A", code, SKIP, f"немає {SECURITY_DOC}"))
+    else:
+        missing = []
+        for title, pattern in SECURITY_SECTIONS:
+            body = doc_section(doc, pattern)
+            if body is None:
+                missing.append(title)
+            else:
+                sections[title] = body
+        if missing:
+            out.append(
+                Result("A", "A1", FAIL, f"у {SECURITY_DOC} немає розділів: {', '.join(missing)}")
+            )
+        else:
+            out.append(Result("A", "A1", OK, f"{SECURITY_DOC} має всі п'ять розділів"))
+
+        body = sections.get("модель загроз")
+        if body is None:
+            out.append(Result("A", "A2", SKIP, "немає розділу про модель загроз"))
+        else:
+            paths = list_items(body)
+            if len(paths) < 3:
+                out.append(
+                    Result("A", "A2", FAIL, f"у моделі загроз {len(paths)} шляхів, потрібно три")
+                )
+            elif len(body.encode("utf-8")) < 500:
+                out.append(Result("A", "A2", FAIL, "модель загроз закоротка: це не одна сторінка"))
+            else:
+                out.append(
+                    Result("A", "A2", OK, f"модель загроз на одну сторінку, шляхів: {len(paths)}")
+                )
+
+        body = sections.get("витік токена")
+        if body is None:
+            out.append(Result("A", "A3", SKIP, "немає розділу про витік токена"))
+        elif token is None:
+            out.append(Result("A", "A3", SKIP, "токена виклику в історії немає, коміт не звірити"))
+        elif not SCANNER.search(body):
+            out.append(
+                Result("A", "A3", FAIL, "у розділі про витік не названо сканер і його вивід")
+            )
+        else:
+            cited = []
+            for candidate in set(COMMIT_HEX.findall(body)):
+                exists = repo.run(["git", "cat-file", "-e", f"{candidate}^{{commit}}"])
+                if exists.returncode != 0:
+                    continue
+                shown = repo.run(["git", "show", "--format=", candidate])
+                if token in shown.stdout:
+                    cited.append(candidate[:7])
+            if cited:
+                out.append(Result("A", "A3", OK, f"витік розібраний, названий коміт {cited[0]}"))
+            else:
+                out.append(
+                    Result(
+                        "A",
+                        "A3",
+                        FAIL,
+                        "у розділі про витік немає хеша коміту, у якому секрет з'явився: "
+                        "візьміть його з рядка Commit у виводі сканера",
+                    )
+                )
+
+        body = sections.get("залежності")
+        if body is None:
+            out.append(Result("A", "A4", SKIP, "немає розділу про залежності"))
+        else:
+            lacks = []
+            if not any(item.lower() in body.lower() for item in CHALLENGE_ADVISORY):
+                lacks.append("ідентифікатор alert (CVE або GHSA)")
+            if not PR_REF.search(body):
+                lacks.append("номер pull request з оновленням")
+            if lacks:
+                out.append(
+                    Result("A", "A4", FAIL, "у розділі про залежності немає: " + ", ".join(lacks))
+                )
+            else:
+                out.append(Result("A", "A4", OK, "закритий alert і pull request оновлення названі"))
+
+    if token is None:
+        out.append(Result("A", "A5", SKIP, "токена виклику в історії немає, дерево не перевірити"))
+    else:
+        leaked = [
+            str(item.relative_to(repo.path))
+            for item in repo.text_files()
+            if token in item.read_text(encoding="utf-8", errors="replace")
+        ]
+        if leaked:
+            out.append(
+                Result("A", "A5", FAIL, "токен виклику досі в дереві: " + ", ".join(leaked[:5]))
+            )
+        else:
+            out.append(Result("A", "A5", OK, "токена виклику в поточному дереві немає"))
+
+    problems = [
+        found
+        for found in (
+            manifest_problem(repo.read("pyproject.toml"), "pyproject.toml", lock=False),
+            manifest_problem(repo.read("requirements.txt"), "requirements.txt", lock=True),
+        )
+        if found
+    ]
+    if any(level == FAIL for level, _ in problems):
+        out.append(Result("A", "A6", FAIL, "; ".join(text for _, text in problems)))
+    elif problems:
+        out.append(Result("A", "A6", WARN, "; ".join(text for _, text in problems)))
+    else:
+        out.append(
+            Result("A", "A6", OK, f"{CHALLENGE_PACKAGE} в обох маніфестах, вразливої версії немає")
+        )
+
+    faults = []
+    env_example = repo.read(".env.example") or ""
+    if not re.search(rf"^\s*{KEY_NAME}\s*=", env_example, re.MULTILINE):
+        faults.append(f"у .env.example немає ключа {KEY_NAME}")
+    for name in repo.tracked_files():
+        if not name.startswith(("src/", "tests/")) or not name.endswith(".py"):
+            continue
+        source = repo.read(name) or ""
+        if KEY_LITERAL.search(source):
+            faults.append(f"ключ зашитий у {name}")
+        if name.startswith("tests/") and KEY_IMPORT.search(source):
+            faults.append(f"тест {name} імпортує ключ з коду")
+    if faults:
+        out.append(Result("A", "A7", FAIL, "; ".join(faults)))
+    else:
+        out.append(Result("A", "A7", OK, f"{KEY_NAME} живе в оточенні, у коді і тестах його немає"))
+
+    policy = repo.read(SECURITY_POLICY)
+    if policy is None:
+        out.append(Result("A", "A8", FAIL, f"{SECURITY_POLICY} не знайдено"))
+    elif len(policy.encode("utf-8")) < 300:
+        size = len(policy.encode("utf-8"))
+        out.append(Result("A", "A8", FAIL, f"{SECURITY_POLICY} закороткий: {size} байтів із 300"))
+    elif not re.search(r"повідом|report", policy, re.IGNORECASE):
+        out.append(
+            Result(
+                "A", "A8", FAIL, f"у {SECURITY_POLICY} не сказано, як повідомити про вразливість"
+            )
+        )
+    else:
+        out.append(Result("A", "A8", OK, f"{SECURITY_POLICY} каже, як повідомити про вразливість"))
+
+    config = repo.read(DEPENDABOT_CONFIG)
+    if config is None:
+        out.append(Result("A", "A9", FAIL, f"{DEPENDABOT_CONFIG} не знайдено"))
+    else:
+        lacks = []
+        if not re.search(r"package-ecosystem:\s*[\"']?(pip|uv|poetry|pipenv)\b", config):
+            lacks.append("екосистема pip")
+        if not re.search(r"schedule:", config) or not re.search(r"interval:", config):
+            lacks.append("розклад schedule.interval")
+        if lacks:
+            out.append(Result("A", "A9", FAIL, f"у {DEPENDABOT_CONFIG} немає: " + ", ".join(lacks)))
+        else:
+            out.append(
+                Result("A", "A9", OK, f"{DEPENDABOT_CONFIG} описує оновлення pip за розкладом")
+            )
+
+    if doc is not None:
+        body = sections.get("знахідка OWASP")
+        if body is None:
+            out.append(Result("A", "A10", SKIP, "немає розділу про знахідку OWASP"))
+        else:
+            lacks = []
+            if not OWASP_CATEGORY.search(body):
+                lacks.append("категорія виду A01:2025")
+            if not CODE_LINE_REF.search(body):
+                lacks.append("файл і рядок")
+            if not PR_REF.search(body):
+                lacks.append("номер pull request з виправленням")
+            if lacks:
+                out.append(
+                    Result("A", "A10", FAIL, "у розділі про знахідку немає: " + ", ".join(lacks))
+                )
+            else:
+                out.append(Result("A", "A10", OK, "знахідка має категорію, рядок і pull request"))
+
+        body = sections.get("дані")
+        if body is None:
+            out.append(Result("A", "A11", SKIP, "немає розділу про дані"))
+        else:
+            rules = list_items(body)
+            if len(rules) < 2:
+                out.append(
+                    Result(
+                        "A",
+                        "A11",
+                        FAIL,
+                        f"правил знеособлення {len(rules)}, потрібно щонайменше два",
+                    )
+                )
+            else:
+                out.append(Result("A", "A11", OK, f"правил знеособлення даних: {len(rules)}"))
+
+    return out
+
+
+def http_status(url: str, headers: dict[str, str]) -> int | None:
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return None
+
+
+def summary_check(repo: Repo) -> Result:
+    """Сервіс піднімається з ключем в оточенні, і /summary слухається саме його."""
+    key = "course-check-" + os.urandom(8).hex()
+    env = dict(
+        os.environ,
+        APP_HOST="127.0.0.1",
+        APP_PORT="8097",
+        APP_ENV=os.environ.get("APP_ENV") or "local",
+        **{KEY_NAME: key},
+    )
+    python = repo.path / ".venv" / "bin" / "python"
+    interpreter = str(python) if python.exists() else sys.executable
+    process = subprocess.Popen(
+        [interpreter, "-m", "app"],
+        cwd=repo.path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    base = "http://127.0.0.1:8097"
+    try:
+        for _ in range(30):
+            time.sleep(1)
+            if http_status(f"{base}/health", {}) == 200:
+                break
+        else:
+            return Result("B", "B1", FAIL, "сервіс не відповів на /health за 30 секунд")
+        without = http_status(f"{base}{SUMMARY_PATH}", {})
+        wrong = http_status(f"{base}{SUMMARY_PATH}", {"X-Internal-Key": "wrong-" + key})
+        right = http_status(f"{base}{SUMMARY_PATH}", {"X-Internal-Key": key})
+        if without not in (401, 403):
+            return Result("B", "B1", FAIL, f"{SUMMARY_PATH} без ключа відповів {without}, а не 401")
+        if wrong not in (401, 403):
+            return Result(
+                "B", "B1", FAIL, f"{SUMMARY_PATH} з чужим ключем відповів {wrong}, а не 401"
+            )
+        if right != 200:
+            return Result(
+                "B",
+                "B1",
+                FAIL,
+                f"{SUMMARY_PATH} з ключем з оточення відповів {right}: сервіс читає не {KEY_NAME}",
+            )
+        return Result("B", "B1", OK, f"{SUMMARY_PATH} пускає лише з ключем з оточення")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def check_lr7_settings(repo: Repo, run_slow: bool) -> list[Result]:
+    out: list[Result] = []
+
+    if run_slow:
+        out.append(summary_check(repo))
+    else:
+        out.append(Result("B", "B1", SKIP, f"{SUMMARY_PATH} не перевірявся, додайте --slow"))
+
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        for code in ("B2", "B3", "B4", "B5", "B6"):
+            out.append(Result("B", code, SKIP, "потрібен gh і remote origin"))
+        return out
+
+    pulls = repo.gh_json(f"repos/{slug}/pulls?state=all&per_page=100")
+    bots = [
+        item
+        for item in (pulls or [])
+        if isinstance(item, dict) and (item.get("user") or {}).get("login") == DEPENDABOT_BOT
+    ]
+    if bots:
+        out.append(
+            Result(
+                "B",
+                "B2",
+                OK,
+                f"Dependabot відкрив pull request #{bots[0].get('number')}: конфігурація працює",
+            )
+        )
+    else:
+        out.append(
+            Result(
+                "B",
+                "B2",
+                WARN,
+                "pull request від dependabot[bot] не знайдено: або все вже оновлене, або "
+                "dependabot.yml не спрацював. Insights, Dependency graph, Dependabot покаже, "
+                "що саме",
+            )
+        )
+
+    owner_only = (
+        "видно лише власнику репозиторію: у пайплайні цей рядок завжди SKIP, локально з "
+        "власним gh він стає OK або FAIL. Стан записується в docs/security.md і читається очима"
+    )
+    info = repo.gh_json(f"repos/{slug}")
+    analysis = (info or {}).get("security_and_analysis") if isinstance(info, dict) else None
+    if not analysis:
+        out.append(Result("B", "B3", SKIP, f"secret scanning {owner_only}"))
+    else:
+        off = [
+            name
+            for name, key in (
+                ("secret scanning", "secret_scanning"),
+                ("push protection", "secret_scanning_push_protection"),
+            )
+            if (analysis.get(key) or {}).get("status") != "enabled"
+        ]
+        if off:
+            out.append(
+                Result("B", "B3", FAIL, "вимкнено: " + ", ".join(off) + ". Settings, Code security")
+            )
+        else:
+            out.append(Result("B", "B3", OK, "secret scanning і push protection увімкнені"))
+
+    status = repo.gh_status(f"repos/{slug}/vulnerability-alerts")
+    if status == 204:
+        out.append(Result("B", "B4", OK, "Dependabot alerts увімкнені"))
+    elif status == 404:
+        out.append(
+            Result(
+                "B",
+                "B4",
+                FAIL,
+                "Dependabot alerts вимкнені: Settings, Code security, Dependabot alerts",
+            )
+        )
+    else:
+        out.append(Result("B", "B4", SKIP, f"Dependabot alerts {owner_only}"))
+
+    reporting = repo.gh_json(f"repos/{slug}/private-vulnerability-reporting")
+    if not isinstance(reporting, dict):
+        out.append(Result("B", "B6", SKIP, "стан private vulnerability reporting не прочитався"))
+    elif reporting.get("enabled"):
+        out.append(Result("B", "B6", OK, "private vulnerability reporting увімкнений"))
+    else:
+        out.append(
+            Result(
+                "B",
+                "B6",
+                FAIL,
+                "private vulnerability reporting вимкнений: Settings, Code security, "
+                "Private vulnerability reporting. Без нього кнопки Report a vulnerability немає",
+            )
+        )
+
+    endpoint = f"repos/{slug}/dependabot/alerts?state=open&package={CHALLENGE_PACKAGE}"
+    if repo.gh_status(endpoint) == 200:
+        alerts = repo.gh_json(endpoint)
+        open_alerts = [item for item in (alerts or []) if isinstance(item, dict)]
+        if open_alerts:
+            paths = ", ".join(
+                (item.get("dependency") or {}).get("manifest_path", "?") for item in open_alerts
+            )
+            out.append(
+                Result(
+                    "B",
+                    "B5",
+                    FAIL,
+                    f"відкритих alert по {CHALLENGE_PACKAGE}: {len(open_alerts)} ({paths})",
+                )
+            )
+        else:
+            out.append(Result("B", "B5", OK, f"відкритих alert по {CHALLENGE_PACKAGE} немає"))
+    else:
+        out.append(Result("B", "B5", SKIP, f"список alert {owner_only}"))
+    return out
+
+
+def commit_pull_request(repo: Repo, slug: str, sha: str) -> dict | None:
+    found = repo.gh_json(f"repos/{slug}/commits/{sha}/pulls")
+    if not isinstance(found, list):
+        return None
+    merged = [item for item in found if isinstance(item, dict) and item.get("merged_at")]
+    return merged[0] if merged else (found[0] if found else None)
+
+
+def check_lr7_process(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+    token = challenge_token(repo)
+    ref = main_ref(repo)
+    slug = repo.slug()
+    api = repo.gh_available() and slug is not None
+
+    added = removed = None
+    if token is None or ref is None:
+        out.append(
+            Result(
+                "C",
+                "C1",
+                FAIL,
+                "токена виклику в історії немає: cherry-pick з course/challenge/lr07 не доїхав",
+            )
+        )
+    else:
+        touched = repo.run(["git", "log", "--format=%H", f"-S{token}", ref]).stdout.split()
+        in_tree = repo.run(["git", "grep", "-q", "-F", token, ref]).returncode == 0
+        if not touched:
+            out.append(
+                Result(
+                    "C",
+                    "C1",
+                    FAIL,
+                    "у main немає коміту з токеном: виклик або не злитий, або злитий squash без "
+                    "коміту колеги. Витік має бути в історії main, інакше розбирати нічого",
+                )
+            )
+        elif in_tree or len(touched) < 2:
+            out.append(
+                Result(
+                    "C",
+                    "C1",
+                    FAIL,
+                    f"токен доданий у {touched[-1][:7]} і досі в main: прибрати окремим "
+                    "pull request",
+                )
+            )
+            added = touched[-1]
+        else:
+            added, removed = touched[-1], touched[0]
+            out.append(
+                Result(
+                    "C",
+                    "C1",
+                    OK,
+                    f"токен доданий у {added[:7]}, прибраний у {removed[:7]}, обидва в main",
+                )
+            )
+
+    if not api:
+        for code in ("C2", "C3", "C4"):
+            out.append(Result("C", code, SKIP, "потрібен gh і remote origin"))
+        return out
+
+    add_pull = commit_pull_request(repo, slug, added) if added else None
+    add_number = add_pull.get("number") if add_pull else None
+
+    if removed is None:
+        out.append(Result("C", "C2", SKIP, "коміту, що прибирає токен, немає"))
+    else:
+        pull = commit_pull_request(repo, slug, removed)
+        if pull is None or not pull.get("merged_at"):
+            out.append(
+                Result("C", "C2", FAIL, "прибирання ключа не прийшло через змержений pull request")
+            )
+        elif add_number and pull.get("number") == add_number:
+            out.append(
+                Result(
+                    "C",
+                    "C2",
+                    WARN,
+                    f"ключ доданий і прибраний в одному pull request #{add_number}: у main він "
+                    "потрапив разом зі своїм видаленням, і розбір витоку тоді про гілку, а не "
+                    "про main",
+                )
+            )
+        else:
+            out.append(Result("C", "C2", OK, f"ключ прибраний pull request #{pull.get('number')}"))
+
+    fix = None
+    if ref is not None:
+        pin = f"-S{CHALLENGE_PACKAGE}=={VULNERABLE_PIN}"
+        log = repo.run(
+            [
+                "git",
+                "log",
+                "-1",
+                "--format=%H",
+                pin,
+                ref,
+                "--",
+                "pyproject.toml",
+                "requirements.txt",
+            ]
+        )
+        fix = log.stdout.strip() or None
+    if fix is None:
+        out.append(
+            Result(
+                "C",
+                "C3",
+                FAIL,
+                f"у main немає коміту, що змінив {CHALLENGE_PACKAGE}=={VULNERABLE_PIN}",
+            )
+        )
+    else:
+        shown = repo.run(
+            ["git", "show", "--format=", fix, "--", "pyproject.toml", "requirements.txt"]
+        ).stdout
+        bumped = re.search(rf"^\+[^\n]*{CHALLENGE_PACKAGE}", shown, re.MULTILINE | re.IGNORECASE)
+        if bumped is None:
+            out.append(
+                Result(
+                    "C",
+                    "C3",
+                    FAIL,
+                    f"останній коміт по {CHALLENGE_PACKAGE} ({fix[:7]}) не оновлює версію, "
+                    "а прибирає",
+                )
+            )
+        else:
+            pull = commit_pull_request(repo, slug, fix)
+            if pull is None or not pull.get("merged_at"):
+                out.append(
+                    Result(
+                        "C",
+                        "C3",
+                        FAIL,
+                        f"оновлення {CHALLENGE_PACKAGE} ({fix[:7]}) не прийшло через змержений "
+                        "pull request",
+                    )
+                )
+            elif add_number and pull.get("number") == add_number:
+                out.append(
+                    Result(
+                        "C",
+                        "C3",
+                        FAIL,
+                        f"оновлення {CHALLENGE_PACKAGE} у тому самому pull request #{add_number}, "
+                        "що й виклик: оновлення має бути окремим",
+                    )
+                )
+            else:
+                out.append(
+                    Result(
+                        "C",
+                        "C3",
+                        OK,
+                        f"оновлення {CHALLENGE_PACKAGE} прийшло pull request #{pull.get('number')}",
+                    )
+                )
+
+    doc = repo.read(SECURITY_DOC) or ""
+    body = doc_section(doc, SECURITY_SECTIONS[4][1]) or ""
+    numbers = [int(item) for item in PR_REF.findall(body)]
+    if not numbers:
+        out.append(
+            Result("C", "C4", SKIP, "у розділі про знахідку OWASP немає номера pull request")
+        )
+    else:
+        good = None
+        for number in dict.fromkeys(numbers):
+            pull = repo.gh_json(f"repos/{slug}/pulls/{number}")
+            if not isinstance(pull, dict) or not pull.get("merged_at"):
+                continue
+            text = (pull.get("title") or "") + "\n" + (pull.get("body") or "")
+            if re.search(r"owasp", text, re.IGNORECASE) or OWASP_CATEGORY.search(text):
+                good = number
+                break
+        shown_numbers = ", ".join("#" + str(n) for n in dict.fromkeys(numbers))
+        if good is None:
+            out.append(
+                Result(
+                    "C",
+                    "C4",
+                    FAIL,
+                    f"pull request {shown_numbers} зі знахідкою OWASP не змержений або в його "
+                    "описі немає категорії OWASP",
+                )
+            )
+        else:
+            out.append(Result("C", "C4", OK, f"знахідка OWASP виправлена pull request #{good}"))
+    return out
+
+
+def run_lr7(repo: Repo, run_slow: bool) -> list[Result]:
+    # Рядок LATER про SECURITY.md з ЛР1 зайвий: за файл відповідає ЛР7.A8.
+    base = [
+        item
+        for item in run_lr6(repo, run_slow)
+        if not (item.code == "ЛР1.A11" and item.message.startswith("SECURITY.md"))
+    ]
+    return base + prefixed(
+        check_lr7_files(repo) + check_lr7_settings(repo, run_slow) + check_lr7_process(repo),
+        "ЛР7",
+    )
+CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4, 5: run_lr5, 6: run_lr6, 7: run_lr7}
 
 
 def render(results: list[Result], lr: int) -> str:
