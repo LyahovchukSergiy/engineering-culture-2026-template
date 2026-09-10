@@ -6,10 +6,12 @@ from app import __version__
 from app.config import settings
 from app.models import Item, ItemCreate
 from app.storage import storage
+from app.summary import router as summary_router
 
 app = FastAPI(title=settings.app_name, version=__version__)
 
 print(f"Стартує {settings.app_name}, оточення {settings.app_env}")
+app.include_router(summary_router)
 
 
 @app.get("/health")
