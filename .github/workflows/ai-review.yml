@@ -1,0 +1,27 @@
+# AI-рев'ю pull request. Коментує і не блокує злиття: у required checks цей
+# workflow не ставиться, approve лишається за людиною.
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Рев'ю дифу
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # Порожні, поки ви не додали свої значення. Ключ тільки з Secrets.
+          AI_REVIEW_URL: ${{ vars.AI_REVIEW_URL }}
+          AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL }}
+          AI_REVIEW_KEY: ${{ secrets.AI_REVIEW_KEY }}
+        run: python3 tools/ai_review.py
