@@ -5355,6 +5355,92 @@ def run_lr12(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
+# --------------------------------------------------------------------------- #
+# ЛР13. Перевірка портфеля і допуск до екзамену
+# --------------------------------------------------------------------------- #
+
+# Балів ця пара не дає і нової роботи не приносить, тому правил тут рівно три.
+# Вони відповідають на три питання, які вирішуються перед сесією: чи зібраний
+# портфель, чи піднімається реліз і чи закриті зауваження викладача.
+
+PORTFOLIO_FILES = (
+    ("README.md", "ЛР1"),
+    ("CONTRIBUTING.md", "ЛР1"),
+    ("CHANGELOG.md", "ЛР6"),
+    ("SECURITY.md", "ЛР7"),
+    ("docs/runbook.md", "ЛР8"),
+    ("docs/slo.md", "ЛР9"),
+    ("docs/ai-review.md", "ЛР11"),
+    ("docs/metrics.md", "ЛР12"),
+    ("docs/retro.md", "ЛР12"),
+)
+PORTFOLIO_DIRS = (
+    ("docs/adr", "ЛР3"),
+    ("docs/postmortems", "ЛР10"),
+    ("docs/ai-log", "ЛР11"),
+)
+REMARKS_TITLE = re.compile(r"зауваження", re.IGNORECASE)
+UNCHECKED = re.compile(r"^\s*[-*]\s*\[ \]", re.MULTILINE)
+
+
+def portfolio_check(repo: Repo) -> Result:
+    missing = [f"{name} ({work})" for name, work in PORTFOLIO_FILES if not repo.exists(name)]
+    for name, work in PORTFOLIO_DIRS:
+        folder = repo.path / name
+        if not folder.is_dir() or not any(folder.glob("*.md")):
+            missing.append(f"{name}/ ({work})")
+    if agents_file(repo) is None:
+        missing.append("AGENTS.md або CLAUDE.md (ЛР11)")
+    if missing:
+        return Result("A", "A1", FAIL, "у портфелі бракує: " + ", ".join(missing))
+    total = len(PORTFOLIO_FILES) + len(PORTFOLIO_DIRS) + 1
+    return Result("A", "A1", OK, f"портфель повний, усіх {total} частин на місці")
+
+
+def remarks_issue(repo: Repo, slug: str) -> dict | None:
+    found = repo.gh_json(f"repos/{slug}/issues?state=all&per_page=100")
+    if not isinstance(found, list):
+        return None
+    for item in found:
+        if not isinstance(item, dict) or "pull_request" in item:
+            continue
+        if REMARKS_TITLE.search(item.get("title") or ""):
+            return item
+    return None
+
+
+def check_lr13_remarks(repo: Repo) -> Result:
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return Result("C", "C1", SKIP, "потрібен gh і remote origin")
+    issue = remarks_issue(repo, slug)
+    if issue is None:
+        return Result("C", "C1", SKIP, "issue із зауваженнями ще не видана")
+    number = issue.get("number")
+    left = len(UNCHECKED.findall(issue.get("body") or ""))
+    if issue.get("state") == "closed":
+        return Result("C", "C1", OK, f"зауваження закриті, issue #{number}")
+    if left:
+        return Result("C", "C1", FAIL, f"у issue #{number} лишилось незакритих зауважень: {left}")
+    return Result("C", "C1", FAIL, f"issue #{number} із зауваженнями ще відкрита")
+
+
+def check_lr13_image(repo: Repo) -> Result:
+    if not OPTIONS["image"]:
+        return Result("B", "B1", SKIP, "образ не піднімався, додайте --image")
+    if not docker_available(repo):
+        return Result("B", "B1", SKIP, "docker недоступний, образ не піднімався")
+    done = run_release_image(repo)
+    return Result("B", "B1", done.level, done.message)
+
+
+def run_lr13(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr12(repo, run_slow) + prefixed(
+        [portfolio_check(repo), check_lr13_image(repo), check_lr13_remarks(repo)],
+        "ЛР13",
+    )
+
+
 CHECKS = {
     1: run_lr1,
     2: run_lr2,
@@ -5368,6 +5454,7 @@ CHECKS = {
     10: run_lr10,
     11: run_lr11,
     12: run_lr12,
+    13: run_lr13,
 }
 
 
@@ -5419,7 +5506,6 @@ def rotation_lines(repo: Repo) -> list[str]:
     titles = {
         "lr03": "ЛР3, рев'ю pull request",
         "lr08": "ЛР8, onboarding за README",
-        "lr13": "ЛР13, рев'ю портфеля",
     }
     out = [f"{login}, підгрупа {entry.get('subgroup', '?')}, номер {entry.get('n', '?')} у кільці."]
     for work, title in titles.items():
