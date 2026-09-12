@@ -37,12 +37,15 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 OK = "OK"
@@ -3614,6 +3617,449 @@ def run_lr8(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
+
+
+# --------------------------------------------------------------------------- #
+# ЛР9. Спостережуваність і SLO
+# --------------------------------------------------------------------------- #
+
+SLO_DOC = "docs/slo.md"
+LOAD_SCRIPT = "tools/load.py"
+HEALTHCHECK_SCRIPT = "tools/healthcheck.py"
+LOG_FIELDS = ("ts", "level", "event", "request_id", "method", "path", "status", "duration_ms")
+SLO_SECTIONS = (
+    ("що вимірюємо", r"вимірюємо|показник|sli"),
+    ("цілі", r"ціл|мет[аи]|target|slo"),
+    ("звідки числа", r"звідки|джерел|дані"),
+    ("error budget", r"budget|бюджет"),
+    ("що робимо при вичерпанні", r"вичерп|коли бюджет|що робимо"),
+)
+PERCENT = re.compile(r"\b(\d{1,2}[.,]\d+|\d{1,3})\s*%")
+MINUTES = re.compile(r"\b(\d[\d\s]{0,8})\s*(хвилин|хв\b)", re.IGNORECASE)
+PRINT_CALL = re.compile(r"(?<![\w.])print\s*\(")
+
+
+def source_files(repo: Repo) -> list[str]:
+    return [
+        name
+        for name in repo.tracked_files()
+        if name.startswith("src/app/") and name.endswith(".py")
+    ]
+
+
+def check_lr9_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    noisy = []
+    for name in source_files(repo):
+        text = repo.read(name) or ""
+        hits = len(PRINT_CALL.findall(text))
+        if hits:
+            noisy.append(f"{name}: {hits}")
+    if not source_files(repo):
+        out.append(Result("A", "A1", SKIP, "у src/app немає файлів Python"))
+    elif noisy:
+        out.append(Result("A", "A1", FAIL, "у src/app лишився print: " + "; ".join(noisy)))
+    else:
+        out.append(Result("A", "A1", OK, "print у src/app немає"))
+
+    entry = repo.read("src/app/__main__.py")
+    if entry is None:
+        out.append(Result("A", "A2", FAIL, "src/app/__main__.py не знайдено"))
+    elif re.search(r"access_log\s*=\s*False", entry):
+        out.append(Result("A", "A2", OK, "власний access-лог uvicorn вимкнений"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A2",
+                FAIL,
+                "у src/app/__main__.py немає access_log=False: кожен запит потрапляє в лог двічі",
+            )
+        )
+
+    for code, path in (("A3", LOAD_SCRIPT), ("A4", HEALTHCHECK_SCRIPT)):
+        if repo.exists(path):
+            out.append(Result("A", code, OK, f"{path} на місці"))
+        else:
+            out.append(Result("A", code, FAIL, f"{path} не знайдено"))
+
+    doc = repo.read(SLO_DOC)
+    if doc is None:
+        out.append(Result("A", "A5", FAIL, f"{SLO_DOC} не знайдено"))
+        for code in ("A6", "A7"):
+            out.append(Result("A", code, SKIP, f"немає {SLO_DOC}"))
+    else:
+        sections = {}
+        missing = []
+        for title, pattern in SLO_SECTIONS:
+            body = doc_section(doc, pattern)
+            if body is None:
+                missing.append(title)
+            else:
+                sections[title] = body
+        if missing:
+            out.append(
+                Result("A", "A5", FAIL, f"у {SLO_DOC} немає розділів: " + ", ".join(missing))
+            )
+        else:
+            out.append(Result("A", "A5", OK, f"у {SLO_DOC} всі п'ять розділів"))
+
+        goals = sections.get("цілі", "")
+        shares = PERCENT.findall(goals)
+        if len(shares) >= 2:
+            out.append(Result("A", "A6", OK, f"у цілях названо часток: {len(shares)}"))
+        else:
+            out.append(
+                Result(
+                    "A",
+                    "A6",
+                    FAIL,
+                    f"у розділі цілей знайдено {len(shares)} чисел з відсотком, потрібно два SLI",
+                )
+            )
+
+        budget = sections.get("error budget", "")
+        found = MINUTES.search(budget)
+        if found:
+            out.append(Result("A", "A7", OK, f"error budget порахований: {found.group(0).strip()}"))
+        else:
+            out.append(
+                Result(
+                    "A",
+                    "A7",
+                    FAIL,
+                    "у розділі error budget немає числа у хвилинах: "
+                    "порахуйте бюджет, а не лише ціль",
+                )
+            )
+
+    runbook = repo.read("docs/runbook.md")
+    if runbook is None:
+        out.append(Result("A", "A8", LATER, "docs/runbook.md з'явиться на ЛР8"))
+    elif re.search(r"лог", runbook, re.IGNORECASE):
+        out.append(Result("A", "A8", OK, "runbook каже, де логи"))
+    else:
+        out.append(Result("A", "A8", FAIL, "у docs/runbook.md немає рядка про логи"))
+
+    return out
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def json_lines(text: str) -> list[dict]:
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            out.append(value)
+    return out
+
+
+def request_records(rows: list[dict]) -> list[dict]:
+    """Рядки про запити: ті, де є метод, шлях і код відповіді."""
+    return [row for row in rows if {"method", "path", "status"} <= set(row)]
+
+
+def run_healthcheck(repo: Repo, url: str) -> int | None:
+    python = repo.path / ".venv" / "bin" / "python"
+    interpreter = str(python) if python.exists() else sys.executable
+    try:
+        done = repo.run([interpreter, HEALTHCHECK_SCRIPT, url], timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return done.returncode
+
+
+def observability_check(repo: Repo) -> list[Result]:
+    """Піднімає сервіс, шле чотири запити і читає те, що він написав у stdout."""
+    codes = ("B1", "B2", "B3", "B4", "B5")
+    port = free_port()
+    env = dict(
+        os.environ,
+        APP_HOST="127.0.0.1",
+        APP_PORT=str(port),
+        APP_ENV=os.environ.get("APP_ENV") or "local",
+        APP_RELOAD="0",
+        # src попереду встановленого пакета: перевіряти треба той код, що лежить
+        # у репозиторії зараз, а не той, що колись поставив make install.
+        PYTHONPATH=str(repo.path / "src"),
+    )
+    python = repo.path / ".venv" / "bin" / "python"
+    interpreter = str(python) if python.exists() else sys.executable
+    base = f"http://127.0.0.1:{port}"
+
+    with tempfile.NamedTemporaryFile("w+", suffix=".log", delete=False) as sink:
+        log_path = Path(sink.name)
+
+    handle = log_path.open("w")
+    process = subprocess.Popen(
+        [interpreter, "-m", "app"], cwd=repo.path, env=env, stdout=handle, stderr=subprocess.STDOUT
+    )
+    try:
+        for _ in range(30):
+            time.sleep(1)
+            if http_status(f"{base}/health", {}) == 200:
+                break
+        else:
+            return [
+                Result("B", code, FAIL, "сервіс не відповів на /health за 30 секунд")
+                for code in codes
+            ]
+
+        sent = [("GET", "/items", None), ("GET", "/items/987654", None)]
+        header_seen = None
+        for method, path, body in sent:
+            request = urllib.request.Request(f"{base}{path}", data=body, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    header_seen = response.headers.get("X-Request-ID") or header_seen
+            except urllib.error.HTTPError as error:
+                header_seen = error.headers.get("X-Request-ID") or header_seen
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+
+        bad = urllib.request.Request(
+            f"{base}/items",
+            data=b'{"title": ""}',
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+        except urllib.error.HTTPError:
+            pass
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+
+        # Аргумент це адреса сервісу, як у прикладі в умові: шлях /health
+        # скрипт студента дописує сам.
+        live = run_healthcheck(repo, base)
+
+        # /metrics читається останнім, після всіх запитів: інакше лічильник
+        # чесно не встиг би побачити те, що ми надіслали після нього.
+        metrics_raw = None
+        try:
+            with urllib.request.urlopen(f"{base}/metrics", timeout=5) as response:
+                metrics_raw = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError, OSError):
+            metrics_raw = None
+
+        handle.flush()
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        handle.close()
+
+    dead = run_healthcheck(repo, f"http://127.0.0.1:{free_port()}")
+    out: list[Result] = []
+
+    rows = request_records(json_lines(text))
+    if not rows:
+        plain = len([line for line in text.splitlines() if line.strip()])
+        out.append(
+            Result(
+                "B",
+                "B1",
+                FAIL,
+                f"жодного рядка JSON про запит у виводі сервісу (рядків усього {plain}): "
+                "логи ще не структуровані",
+            )
+        )
+        for code in ("B2", "B3"):
+            out.append(Result("B", code, SKIP, "немає рядків про запити"))
+    else:
+        gaps = sorted({field for row in rows for field in LOG_FIELDS if field not in row})
+        if gaps:
+            out.append(
+                Result("B", "B1", FAIL, "у рядках про запит немає полів: " + ", ".join(gaps))
+            )
+        else:
+            out.append(Result("B", "B1", OK, f"рядків про запити: {len(rows)}, поля на місці"))
+
+        problems = []
+        stamps = [row.get("ts") for row in rows if row.get("ts")]
+        aware = 0
+        for value in stamps:
+            try:
+                if datetime.fromisoformat(str(value)).tzinfo is not None:
+                    aware += 1
+            except (TypeError, ValueError):
+                pass
+        if aware != len(stamps) or not stamps:
+            problems.append("ts не ISO або без часового поясу")
+        ids = {row.get("request_id") for row in rows}
+        if len(ids) < min(2, len(rows)):
+            problems.append(f"request_id однаковий у різних запитів ({len(ids)} на {len(rows)})")
+        if problems:
+            out.append(Result("B", "B2", FAIL, "; ".join(problems)))
+        else:
+            out.append(Result("B", "B2", OK, f"час із поясом, різних request_id: {len(ids)}"))
+
+        failed = [
+            row for row in rows if isinstance(row.get("status"), int) and row["status"] >= 400
+        ]
+        if not failed:
+            out.append(Result("B", "B3", SKIP, "серед запитів не було жодного з кодом 400 і вище"))
+        else:
+            wrong = [
+                f"{row.get('path')}: {row.get('status')} як {row.get('level')}"
+                for row in failed
+                if str(row.get("level", "")).lower() not in {"warning", "warn", "error"}
+            ]
+            if wrong:
+                out.append(
+                    Result("B", "B3", FAIL, "рівень не залежить від коду: " + ", ".join(wrong[:3]))
+                )
+            else:
+                out.append(
+                    Result("B", "B3", OK, "коди 400 і вище пишуться рівнем warning або error")
+                )
+
+    if header_seen:
+        out.append(Result("B", "B4", OK, f"заголовок X-Request-ID повертається: {header_seen}"))
+    else:
+        out.append(Result("B", "B4", FAIL, "у відповіді немає заголовка X-Request-ID"))
+
+    if not isinstance(metrics_raw, dict):
+        out.append(Result("B", "B5", FAIL, "GET /metrics не віддав JSON-обʼєкт"))
+    else:
+        flat = json.dumps(metrics_raw, ensure_ascii=False)
+        gaps = [
+            name
+            for name in ("requests_total", "errors_total")
+            if not isinstance(metrics_raw.get(name), int)
+        ]
+        has_p95 = any("p95" in key for key in metrics_raw)
+        breakdown = [
+            value
+            for value in metrics_raw.values()
+            if isinstance(value, dict) and value and all(str(key).isdigit() for key in value)
+        ]
+        if gaps:
+            out.append(Result("B", "B5", FAIL, "у /metrics немає лічильників: " + ", ".join(gaps)))
+        elif not has_p95:
+            out.append(Result("B", "B5", FAIL, "у /metrics немає значення p95 тривалості"))
+        elif not breakdown:
+            out.append(Result("B", "B5", FAIL, "у /metrics немає розбивки за кодами відповіді"))
+        elif metrics_raw["requests_total"] < 4:
+            out.append(
+                Result(
+                    "B",
+                    "B5",
+                    FAIL,
+                    f"requests_total={metrics_raw['requests_total']}, а запитів було "
+                    "щонайменше чотири: лічильник рухається не на кожен запит",
+                )
+            )
+        elif not any(int(code) >= 400 for value in breakdown for code in value):
+            out.append(
+                Result(
+                    "B",
+                    "B5",
+                    FAIL,
+                    "у розбивці за кодами немає жодного 4xx, хоча один поганий запит був "
+                    "надісланий: лічильник рахує тільки успішні",
+                )
+            )
+        else:
+            out.append(Result("B", "B5", OK, f"лічильники сходяться: {flat[:90]}"))
+
+    if live is None or dead is None:
+        out.append(Result("B", "B6", FAIL, f"{HEALTHCHECK_SCRIPT} не запустився"))
+    elif live != 0:
+        out.append(
+            Result("B", "B6", FAIL, f"{HEALTHCHECK_SCRIPT} на живому сервісі дав код {live}")
+        )
+    elif dead == 0:
+        out.append(
+            Result("B", "B6", FAIL, f"{HEALTHCHECK_SCRIPT} дав нуль на порту, де нікого немає")
+        )
+    else:
+        out.append(Result("B", "B6", OK, f"healthcheck: живий 0, мертвий {dead}"))
+
+    log_path.unlink(missing_ok=True)
+    return out
+
+
+def check_lr9_service(repo: Repo, run_slow: bool) -> list[Result]:
+    if not run_slow:
+        return [
+            Result("B", code, SKIP, "сервіс не піднімався, додайте --slow")
+            for code in ("B1", "B2", "B3", "B4", "B5", "B6")
+        ]
+    return observability_check(repo)
+
+
+def check_lr9_process(repo: Repo) -> list[Result]:
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in ("C1", "C2")]
+
+    log = repo.run(["git", "log", "-1", "--format=%H", "main", "--", "src/app/main.py"])
+    sha = log.stdout.strip()
+    if not sha:
+        return [
+            Result("C", "C1", FAIL, "src/app/main.py не мінявся в main"),
+            Result("C", "C2", SKIP, "немає коміту, у якому шукати print"),
+        ]
+
+    pull = commit_pull_request(repo, slug, sha)
+    if pull is None or not pull.get("merged_at"):
+        out = [
+            Result(
+                "C",
+                "C1",
+                FAIL,
+                "остання зміна src/app/main.py не прийшла через змержений pull request",
+            )
+        ]
+    else:
+        out = [
+            Result("C", "C1", OK, f"зміни сервісу прийшли через pull request #{pull.get('number')}")
+        ]
+
+    removed = repo.run(
+        ["git", "log", "--format=%H", "-S", "print(", "main", "--", "src/app/main.py"]
+    )
+    shas = [line.strip() for line in removed.stdout.splitlines() if line.strip()]
+    if len(shas) >= 2:
+        out.append(Result("C", "C2", OK, f"у main є коміт, який прибрав print: {shas[0][:8]}"))
+    elif repo.read("src/app/main.py") and PRINT_CALL.search(repo.read("src/app/main.py") or ""):
+        out.append(Result("C", "C2", FAIL, "print у src/app/main.py досі на місці"))
+    else:
+        out.append(
+            Result(
+                "C",
+                "C2",
+                WARN,
+                "не видно коміту, який прибрав print: історія переписана або файл замінений цілком",
+            )
+        )
+    return out
+
+
+def run_lr9(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr8(repo, run_slow) + prefixed(
+        check_lr9_files(repo) + check_lr9_service(repo, run_slow) + check_lr9_process(repo),
+        "ЛР9",
+    )
+
+
 CHECKS = {
     1: run_lr1,
     2: run_lr2,
@@ -3623,6 +4069,7 @@ CHECKS = {
     6: run_lr6,
     7: run_lr7,
     8: run_lr8,
+    9: run_lr9,
 }
 
 
