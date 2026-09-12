@@ -37,6 +37,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -4059,7 +4060,9 @@ def check_lr9_process(repo: Repo) -> list[Result]:
     if not repo.gh_available() or slug is None:
         return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in ("C1", "C2")]
 
-    log = repo.run(["git", "log", "-1", "--format=%H", "main", "--", "src/app/main.py"])
+    log = repo.run(
+        ["git", "log", "-1", "--format=%H", main_ref(repo) or "HEAD", "--", "src/app/main.py"]
+    )
     sha = log.stdout.strip()
     if not sha:
         return [
@@ -4082,9 +4085,8 @@ def check_lr9_process(repo: Repo) -> list[Result]:
             Result("C", "C1", OK, f"зміни сервісу прийшли через pull request #{pull.get('number')}")
         ]
 
-    removed = repo.run(
-        ["git", "log", "--format=%H", "-S", "print(", "main", "--", "src/app/main.py"]
-    )
+    ref = main_ref(repo) or "HEAD"
+    removed = repo.run(["git", "log", "--format=%H", "-S", "print(", ref, "--", "src/app/main.py"])
     shas = [line.strip() for line in removed.stdout.splitlines() if line.strip()]
     if len(shas) >= 2:
         out.append(Result("C", "C2", OK, f"у main є коміт, який прибрав print: {shas[0][:8]}"))
@@ -4148,7 +4150,11 @@ def check_lr10_files(repo: Repo) -> list[Result]:
         out.append(Result("A", "A1", FAIL, f"{ARCHIVE_MODULE} немає ні в дереві, ні в історії"))
 
     wired = [name for name in source_files(repo) if HOOK in (repo.read(name) or "")]
-    history = repo.run(["git", "log", "--format=%H", "-S", HOOK, "main"])
+    # Пошук обмежений src: без цього правилу вистачає будь-якого коміту, де
+    # рядок трапився в тексті самого валідатора.
+    history = repo.run(
+        ["git", "log", "--format=%H", "-S", HOOK, main_ref(repo) or "HEAD", "--", "src"]
+    )
     ever = [line for line in history.stdout.splitlines() if line.strip()]
     if wired:
         out.append(Result("A", "A2", OK, "модуль підключений у " + ", ".join(wired)))
@@ -4347,7 +4353,11 @@ def check_lr10_process(repo: Repo) -> list[Result]:
     if not repo.gh_available() or slug is None:
         return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in ("C1", "C2")]
 
-    history = repo.run(["git", "log", "--format=%H", "-S", HOOK, "main"])
+    # Пошук обмежений src: без цього правилу вистачає будь-якого коміту, де
+    # рядок трапився в тексті самого валідатора.
+    history = repo.run(
+        ["git", "log", "--format=%H", "-S", HOOK, main_ref(repo) or "HEAD", "--", "src"]
+    )
     shas = [line.strip() for line in history.stdout.splitlines() if line.strip()]
     if not shas:
         out = [Result("C", "C1", FAIL, f"у main немає коміту, який підключив {HOOK}")]
@@ -4404,6 +4414,531 @@ def run_lr10(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
+# --------------------------------------------------------------------------- #
+# ЛР11. AI у робочому процесі
+# --------------------------------------------------------------------------- #
+
+REPORTS_MODULE = "src/app/reports.py"
+REVIEW_DOC = "docs/ai-review.md"
+REVIEW_WORKFLOW = ".github/workflows/ai-review.yml"
+AI_LOG_DIR = "docs/ai-log"
+PATCH_URL = (
+    "https://raw.githubusercontent.com/LyahovchukSergiy/engineering-culture-2026-template/"
+    "challenge/lr11/src/app/reports.py"
+)
+FINDING_HEAD = re.compile(r"^#{2,4}\s*знахідка\b", re.IGNORECASE)
+FINDING_PARTS = (
+    ("що не так", r"^\W*що не так\b"),
+    ("чим загрожує", r"^\W*чим загрожує\b"),
+    ("як перевірено", r"^\W*як перевірено\b"),
+)
+FILE_LINE = re.compile(r"[\w./-]+\.(?:py|yml|yaml|toml|md)[:# ]{1,2}(?:L)?\d+")
+AGENTS_SECTIONS = (
+    ("проєкт", r"проєкт|проект|project|стек"),
+    ("команди", r"команд|commands"),
+    ("правила", r"правил|rules|межі"),
+    ("як працювати", r"як працювати|як працюємо|процес|порядок|workflow"),
+)
+AGENTS_KEEP = r"не вимикати|не послаблювати|не міняти|не правити|не видаляти|не позначати"
+AGENTS_KEEP += r"|не пропускати|не підганяти"
+AGENTS_TESTS = re.compile(
+    rf"тест\w*[^.!?]{{0,80}}?(?:{AGENTS_KEEP})|(?:{AGENTS_KEEP})[^.!?]{{0,80}}?тест\w*",
+    re.IGNORECASE,
+)
+AGENTS_BORDER = re.compile(r"workflows|секрет|secret|\.env|пайплайн", re.IGNORECASE)
+LOG_SECTIONS = (
+    ("завдання і промпт", r"промпт|prompt|завдання"),
+    ("що видав асистент", r"що видав|вивід|відповідь асистента|результат"),
+    ("що виправили руками", r"виправ|правки руками|що змінив"),
+)
+LOG_REFLECTION = re.compile(r"помилив|помилка інструмент|де інструмент", re.IGNORECASE)
+LITERAL_SECRET = re.compile(
+    r"^[^#\n]*?\b([A-Za-z_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z_]*)\s*:\s*(?!\s*$)(.+)$",
+    re.IGNORECASE,
+)
+PROBE_MARKER = "ЗОНД-ЛР11 "
+PROBE_FILE = "probe-lr11.csv"
+PROBE = f'''import json
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app, raise_server_exceptions=False)
+# Спершу обхід теки, поки список порожній: на непочиненому модулі експорт з
+# записом падає ще до запису файла, і дірку було б не видно.
+probe = client.get("/reports/export.csv", params={{"filename": "../{PROBE_FILE}"}})
+created = client.post("/items", json={{"title": "Заявка, з комою"}})
+export = client.get("/reports/export.csv")
+print(
+    "{PROBE_MARKER}"
+    + json.dumps(
+        {{
+            "created": created.status_code,
+            "status": export.status_code,
+            "body": export.text[:4000],
+            "probe": probe.status_code,
+        }}
+    )
+)
+'''
+
+
+def fetch_text(url: str) -> str | None:
+    """Анонімне читання файла з публічного репозиторію курсу."""
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+
+def reports_wired(repo: Repo) -> str | None:
+    """Файл, у якому роутер звітів підключений до застосунку."""
+    for name in source_files(repo):
+        text = repo.read(name) or ""
+        if "include_router" not in text or "reports" not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        from_reports = any(
+            isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "reports"
+            for node in ast.walk(tree)
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Attribute) and node.func.attr == "include_router"):
+                continue
+            argument = " ".join(ast.unparse(item) for item in node.args)
+            if from_reports or "reports" in argument:
+                return name
+    return None
+
+
+def finding_blocks(text: str) -> list[str]:
+    """Розбиває документ рев'ю на блоки знахідок за заголовками."""
+    blocks: list[str] = []
+    current: list[str] | None = None
+    for line in text.splitlines():
+        if FINDING_HEAD.match(line):
+            if current is not None:
+                blocks.append("\n".join(current))
+            current = [line]
+        elif current is not None:
+            if line.lstrip().startswith("#") and not FINDING_HEAD.match(line):
+                blocks.append("\n".join(current))
+                current = None
+            else:
+                current.append(line)
+    if current is not None:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def agents_file(repo: Repo) -> tuple[str, str] | None:
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        text = repo.read(name)
+        if text:
+            return name, text
+    return None
+
+
+def ai_log_files(repo: Repo) -> list[str]:
+    return sorted(
+        name
+        for name in repo.tracked_files()
+        if name.startswith(f"{AI_LOG_DIR}/") and name.endswith(".md")
+    )
+
+
+def check_lr11_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    if repo.exists(REPORTS_MODULE):
+        out.append(Result("A", "A1", OK, "модуль звітів на місці"))
+    else:
+        out.append(Result("A", "A1", FAIL, f"немає {REPORTS_MODULE}"))
+
+    wired = reports_wired(repo)
+    if wired:
+        out.append(Result("A", "A2", OK, f"роутер звітів підключений у {wired}"))
+    else:
+        out.append(Result("A", "A2", FAIL, "роутер звітів не підключений через include_router"))
+
+    doc = repo.read(REVIEW_DOC)
+    if doc is None:
+        out.append(Result("A", "A3", FAIL, f"немає {REVIEW_DOC}"))
+        out.append(Result("A", "A4", SKIP, "немає документа рев'ю"))
+        out.append(Result("A", "A5", SKIP, "немає документа рев'ю"))
+    else:
+        blocks = finding_blocks(doc)
+        out.append(
+            Result("A", "A3", OK, f"{REVIEW_DOC}, знахідок у документі: {len(blocks)}")
+            if len(blocks) >= 4
+            else Result(
+                "A",
+                "A3",
+                FAIL,
+                f"у {REVIEW_DOC} знайдено розділів «Знахідка»: {len(blocks)}, треба чотири",
+            )
+        )
+        incomplete = []
+        for number, block in enumerate(blocks[:8], 1):
+            missing = [
+                title
+                for title, pattern in FINDING_PARTS
+                if not re.search(pattern, block, re.IGNORECASE | re.MULTILINE)
+            ]
+            if missing:
+                incomplete.append(f"знахідка {number} без «{'», «'.join(missing)}»")
+        if incomplete:
+            out.append(Result("A", "A4", FAIL, "; ".join(incomplete)))
+        elif blocks:
+            out.append(Result("A", "A4", OK, "у кожній знахідці всі три частини"))
+        else:
+            out.append(Result("A", "A4", SKIP, "знахідок не знайдено"))
+
+        without_line = [
+            str(number) for number, block in enumerate(blocks[:8], 1) if not FILE_LINE.search(block)
+        ]
+        if without_line:
+            out.append(
+                Result("A", "A5", FAIL, "без посилання на файл і рядок: " + ", ".join(without_line))
+            )
+        elif blocks:
+            out.append(Result("A", "A5", OK, "кожна знахідка вказує файл і рядок"))
+        else:
+            out.append(Result("A", "A5", SKIP, "знахідок не знайдено"))
+
+    found = agents_file(repo)
+    if found is None:
+        out.append(Result("A", "A6", FAIL, "немає AGENTS.md або CLAUDE.md у корені"))
+        out.append(Result("A", "A7", SKIP, "немає файла контексту агента"))
+    else:
+        name, text = found
+        missing = [
+            title for title, pattern in AGENTS_SECTIONS if not re.search(pattern, text, re.I)
+        ]
+        if missing:
+            out.append(Result("A", "A6", FAIL, f"у {name} немає розділів: " + ", ".join(missing)))
+        else:
+            out.append(Result("A", "A6", OK, f"{name} з чотирьох розділів"))
+        gaps = []
+        flat = re.sub(r"\s+", " ", text)
+        if not AGENTS_TESTS.search(flat):
+            gaps.append("правило «наявні тести не вимикати і не послаблювати»")
+        if not AGENTS_BORDER.search(text):
+            gaps.append("межі: пайплайн, секрети, .env")
+        if gaps:
+            out.append(Result("A", "A7", FAIL, f"у {name} немає: " + ", ".join(gaps)))
+        else:
+            out.append(Result("A", "A7", OK, "правило про тести і межі агента названі"))
+
+    flow = repo.read(REVIEW_WORKFLOW)
+    if flow is None:
+        out.append(Result("A", "A8", FAIL, f"немає {REVIEW_WORKFLOW}"))
+        out.append(Result("A", "A9", SKIP, "немає workflow рев'ю"))
+    else:
+        gaps = []
+        if not re.search(r"^\s*pull_request\s*:", flow, re.MULTILINE):
+            gaps.append("тригер pull_request")
+        if not re.search(r"pull-requests\s*:\s*write", flow):
+            gaps.append("дозвіл pull-requests: write")
+        if gaps:
+            out.append(Result("A", "A8", FAIL, "у workflow рев'ю немає: " + ", ".join(gaps)))
+        else:
+            out.append(Result("A", "A8", OK, "workflow рев'ю на кожен pull request"))
+
+        literal = []
+        for line in flow.splitlines():
+            match = LITERAL_SECRET.search(line)
+            if not match:
+                continue
+            value = match.group(2).strip().strip("\"'")
+            if value and "${{" not in value:
+                literal.append(match.group(1))
+        if literal:
+            out.append(
+                Result(
+                    "A",
+                    "A9",
+                    FAIL,
+                    "у workflow лежить значення ключа: " + ", ".join(sorted(set(literal))),
+                )
+            )
+        else:
+            out.append(Result("A", "A9", OK, "ключів у файлі workflow немає"))
+
+    logs = ai_log_files(repo)
+    if not logs:
+        out.append(Result("A", "A10", FAIL, f"у {AI_LOG_DIR}/ немає жодного файла .md"))
+        out.append(Result("A", "A11", SKIP, "немає журналу"))
+        return out
+
+    text = repo.read(logs[-1]) or ""
+    missing = [title for title, pattern in LOG_SECTIONS if not re.search(pattern, text, re.I)]
+    if missing:
+        out.append(Result("A", "A10", FAIL, f"у {logs[-1]} немає: " + ", ".join(missing)))
+    else:
+        out.append(Result("A", "A10", OK, f"журнал {logs[-1]} з усіма розділами"))
+
+    if LOG_REFLECTION.search(text):
+        out.append(Result("A", "A11", OK, "рефлексія про помилку інструмента є"))
+    else:
+        out.append(
+            Result("A", "A11", FAIL, f"у {logs[-1]} немає розділу про те, де інструмент помилився")
+        )
+    return out
+
+
+def student_python(repo: Repo) -> Path | None:
+    python = repo.path / ".venv" / "bin" / "python"
+    return python if python.exists() else None
+
+
+def export_probe(repo: Repo, run_slow: bool) -> list[Result]:
+    """Піднімає застосунок студента в тимчасовому каталозі і смикає експорт."""
+    codes = ("B1", "B2")
+    if not run_slow:
+        return [Result("B", code, SKIP, "експорт не перевірявся, додайте --slow") for code in codes]
+
+    python = student_python(repo)
+    if python is None:
+        return [Result("B", code, SKIP, "немає .venv, спершу make install") for code in codes]
+
+    with tempfile.TemporaryDirectory() as raw:
+        stage = Path(raw)
+        script = stage / "probe.py"
+        script.write_text(PROBE, encoding="utf-8")
+        env = dict(
+            os.environ,
+            APP_ENV=os.environ.get("APP_ENV") or "local",
+            PYTHONPATH=str(repo.path / "src"),
+            PYTHONIOENCODING="utf-8",
+        )
+        try:
+            done = subprocess.run(
+                [str(python), str(script)],
+                cwd=stage,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return [
+                Result("B", code, FAIL, f"застосунок не піднявся: {type(error).__name__}")
+                for code in codes
+            ]
+
+        payload = None
+        for line in done.stdout.splitlines():
+            if line.startswith(PROBE_MARKER):
+                try:
+                    payload = json.loads(line[len(PROBE_MARKER) :])
+                except json.JSONDecodeError:
+                    payload = None
+        if payload is None:
+            tail = (done.stderr or done.stdout).strip().splitlines()[-2:]
+            return [
+                Result("B", code, FAIL, "зонд не відповів: " + " / ".join(tail)) for code in codes
+            ]
+
+        out: list[Result] = []
+        status = payload.get("status")
+        body = payload.get("body") or ""
+        if status != 200:
+            out.append(
+                Result(
+                    "B",
+                    "B1",
+                    FAIL,
+                    f"GET /reports/export.csv на одному записі віддав {status}, а не 200",
+                )
+            )
+        elif "Заявка" not in body:
+            out.append(
+                Result("B", "B1", FAIL, "експорт віддав 200, але створеного запису в ньому немає")
+            )
+        else:
+            rows = len([line for line in body.strip().splitlines() if line.strip()])
+            out.append(Result("B", "B1", OK, f"експорт віддає запис, рядків у відповіді: {rows}"))
+
+        escaped = sorted(
+            str(item.relative_to(stage))
+            for item in stage.iterdir()
+            if item.is_file() and item.name != "probe.py"
+        )
+        if escaped:
+            out.append(
+                Result(
+                    "B",
+                    "B2",
+                    FAIL,
+                    "параметр із ../ вивів запис за теку експорту: " + ", ".join(escaped),
+                )
+            )
+        else:
+            out.append(Result("B", "B2", OK, "запис за теку експорту не виходить"))
+        return out
+
+
+def tests_catch_patch(repo: Repo, run_slow: bool) -> Result:
+    """Ганяє тести студента на початковому модулі: вони мають впасти."""
+    if not run_slow:
+        return Result("B", "B3", SKIP, "тести не запускались, додайте --slow")
+
+    python = student_python(repo)
+    if python is None:
+        return Result("B", "B3", SKIP, "немає .venv, спершу make install")
+
+    original = fetch_text(PATCH_URL)
+    if original is None:
+        return Result("B", "B3", SKIP, "початковий модуль з гілки курсу не прочитався")
+
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info")
+    with tempfile.TemporaryDirectory() as raw:
+        stage = Path(raw)
+        for name in ("src", "tests", "legacy"):
+            source = repo.path / name
+            if source.is_dir():
+                shutil.copytree(source, stage / name, ignore=ignore)
+        for name in ("pyproject.toml", "conftest.py"):
+            source = repo.path / name
+            if source.is_file():
+                shutil.copy2(source, stage / name)
+        target = stage / REPORTS_MODULE
+        if not target.parent.is_dir():
+            return Result("B", "B3", SKIP, "у репозиторії немає src/app")
+        target.write_text(original, encoding="utf-8")
+        try:
+            done = subprocess.run(
+                [str(python), "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                cwd=stage,
+                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return Result("B", "B3", SKIP, f"pytest не запустився: {type(error).__name__}")
+
+    if done.returncode == 0:
+        return Result(
+            "B",
+            "B3",
+            FAIL,
+            "на початковому модулі ваші тести зелені, тобто дефект вони не ловлять",
+        )
+    tail = [line for line in done.stdout.splitlines() if line.strip()][-1:]
+    return Result("B", "B3", OK, "на початковому модулі тести падають: " + " ".join(tail))
+
+
+def check_lr11_process(repo: Repo) -> list[Result]:
+    codes = ("C1", "C2", "C3", "C4")
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in codes]
+
+    out: list[Result] = []
+    history = repo.run(["git", "log", "--format=%H", "--", REPORTS_MODULE])
+    shas = [line.strip() for line in history.stdout.splitlines() if line.strip()]
+    pull = commit_pull_request(repo, slug, shas[-1]) if shas else None
+    if not shas:
+        out.append(Result("C", "C1", FAIL, f"у історії немає коміту з {REPORTS_MODULE}"))
+        out.append(Result("C", "C2", SKIP, "немає pull request з патчем"))
+    elif pull is None:
+        out.append(Result("C", "C1", FAIL, "патч приїхав у main не через pull request"))
+        out.append(Result("C", "C2", SKIP, "немає pull request з патчем"))
+    else:
+        number = pull.get("number")
+        out.append(Result("C", "C1", OK, f"патч приїхав через pull request #{number}"))
+        owner = slug.split("/")[0].lower()
+        comments = repo.gh_json(f"repos/{slug}/pulls/{number}/comments?per_page=100")
+        mine = [
+            item
+            for item in comments or []
+            if (item.get("user") or {}).get("login", "").lower() == owner
+        ]
+        if len(mine) >= 4:
+            out.append(Result("C", "C2", OK, f"у PR #{number} ваших коментарів рев'ю: {len(mine)}"))
+        else:
+            out.append(
+                Result(
+                    "C",
+                    "C2",
+                    FAIL,
+                    f"у PR #{number} ваших коментарів на рядках {len(mine)}, треба чотири",
+                )
+            )
+
+    runs = repo.gh_json(
+        f"repos/{slug}/actions/workflows/ai-review.yml/runs?event=pull_request&per_page=20"
+    )
+    done_runs = [
+        item
+        for item in ((runs or {}).get("workflow_runs") or [])
+        if item.get("status") == "completed"
+    ]
+    bots: list[str] = []
+    endpoints = (
+        f"repos/{slug}/issues/comments?per_page=100",
+        f"repos/{slug}/pulls/comments?per_page=100",
+    )
+    for endpoint in endpoints:
+        for item in repo.gh_json(endpoint) or []:
+            user = item.get("user") or {}
+            if user.get("type") == "Bot":
+                bots.append(user.get("login", "бот"))
+    if not done_runs:
+        out.append(Result("C", "C3", FAIL, "workflow ai-review жодного разу не прогнався на PR"))
+    elif not bots:
+        out.append(
+            Result("C", "C3", FAIL, "workflow прогнався, але коментаря від інструмента в PR немає")
+        )
+    else:
+        out.append(
+            Result(
+                "C",
+                "C3",
+                OK,
+                f"прогонів на PR: {len(done_runs)}, коментарів від {sorted(set(bots))[0]}: "
+                f"{len(bots)}",
+            )
+        )
+
+    contexts = required_contexts(repo, slug)
+    if contexts is None:
+        out.append(Result("C", "C4", SKIP, "налаштування захисту main не читаються"))
+    else:
+        blocking = sorted(name for name in contexts if "review" in name.lower())
+        if blocking:
+            out.append(
+                Result(
+                    "C",
+                    "C4",
+                    FAIL,
+                    "AI-рев'ю стоїть у required checks і блокує злиття: " + ", ".join(blocking),
+                )
+            )
+        else:
+            out.append(Result("C", "C4", OK, "AI-рев'ю не блокує злиття"))
+    return out
+
+
+def run_lr11(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr10(repo, run_slow) + prefixed(
+        check_lr11_files(repo)
+        + export_probe(repo, run_slow)
+        + [tests_catch_patch(repo, run_slow)]
+        + check_lr11_process(repo),
+        "ЛР11",
+    )
+
+
 CHECKS = {
     1: run_lr1,
     2: run_lr2,
@@ -4415,6 +4950,7 @@ CHECKS = {
     8: run_lr8,
     9: run_lr9,
     10: run_lr10,
+    11: run_lr11,
 }
 
 
