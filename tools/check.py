@@ -2433,7 +2433,7 @@ DEPENDABOT_BOT = "dependabot[bot]"
 
 
 def digest(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(value.replace("\r\n", "\n").encode("utf-8")).hexdigest()
 
 
 def challenge_token(repo: Repo) -> str | None:
@@ -4939,6 +4939,422 @@ def run_lr11(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
+# --------------------------------------------------------------------------- #
+# ЛР12. Метрики власного репозиторію і ретро
+# --------------------------------------------------------------------------- #
+
+METRICS_DOC = "docs/metrics.md"
+RETRO_DOC = "docs/retro.md"
+DORA_TOOL = "tools/dora.py"
+DORA_URL = (
+    "https://raw.githubusercontent.com/LyahovchukSergiy/engineering-culture-2026-template/"
+    "challenge/lr12/tools/dora.py"
+)
+# Скрипт метрик лежить у гілці виклику, а не тут. У валідаторі від нього тільки
+# відбиток: правило A1 відрізняє курсову версію від переписаної, а числа
+# перераховуються курсовою версією, чия б копія не запустилась.
+DORA_SHA = "96e24e80b38704b2210147d1ebc079712a1b768b414cd23cc737aa8d24f51ae8"
+DORA_CALL = re.compile(r"dora\.py\s+--since\s+(\S+)\s+--until\s+(\S+)\s+--split\s+([^\s`]+)")
+METRIC_NAMES = (
+    "Частота поставки",
+    "Час проходження зміни",
+    "Частка невдалих змін",
+    "Час відновлення",
+)
+WEEK_ROW = re.compile(r"^\|\s*\d{4}-\d{2}-\d{2}\s*\|")
+SPLIT_ROW = re.compile(r"^\|\s*(до|від)\s+\d{4}-\d{2}-\d{2}\s*\|")
+ANY_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}\.\d{2}\.\d{4}\b")
+ISSUE_REF = re.compile(r"#(\d+)\b")
+COMMIT_REF = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+
+def wrapped_items(body: str) -> list[str]:
+    """Пункти списку разом із продовженням на наступних рядках.
+
+    list_items бере тільки перший рядок пункту, а термін зміни студент цілком
+    природно переносить на другий рядок, і тоді дати в пункті ніби немає.
+    """
+    out: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("- ", "* ", "+ ")) or re.match(r"^\d+\.\s", stripped):
+            out.append(stripped)
+        elif out and stripped and line.startswith((" ", "\t")):
+            out[-1] += " " + stripped
+    return out
+
+
+def flat(text: str) -> set[str]:
+    """Рядки тексту без різниці у пробілах: таблицю зі скрипта студент може
+    вирівняти інакше, і це не привід червоніти."""
+    return {re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()}
+
+
+_dora_cache: dict[str, tuple[str | None, str, bool]] = {}
+
+
+def dora_source(repo: Repo) -> tuple[str | None, str, bool]:
+    """Курсовий скрипт метрик. Локальна копія береться тільки тоді, коли вона не
+    змінена, інакше свіжа з гілки виклику: числа має рахувати те саме, що обіцяє
+    умова, а не те, що студент дописав."""
+    key = str(repo.path)
+    if key in _dora_cache:
+        return _dora_cache[key]
+    local = repo.read(DORA_TOOL)
+    fresh = fetch_text(DORA_URL)
+    known = {DORA_SHA}
+    if fresh:
+        known.add(digest(fresh))
+    own = bool(local and digest(local) in known)
+    if own:
+        value = (local, "ваша копія скрипта", True)
+    elif fresh:
+        value = (fresh, "скрипт з гілки курсу", False)
+    else:
+        value = (None, "скрипт курсу не прочитався", False)
+    _dora_cache[key] = value
+    return value
+
+
+def dora_json(script: str, repo: Repo, window: tuple[str, str, str]) -> dict | None:
+    since, until, split = window
+    with tempfile.TemporaryDirectory() as raw:
+        path = Path(raw) / "dora.py"
+        path.write_text(script, encoding="utf-8")
+        try:
+            done = subprocess.run(
+                [
+                    sys.executable,
+                    str(path),
+                    "--repo",
+                    str(repo.path),
+                    "--since",
+                    since,
+                    "--until",
+                    until,
+                    "--split",
+                    split,
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    if done.returncode != 0:
+        return None
+    try:
+        value = json.loads(done.stdout)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def metrics_window(repo: Repo) -> tuple[str, str, str] | None:
+    text = repo.read(METRICS_DOC) or ""
+    found = DORA_CALL.search(text)
+    return (found.group(1), found.group(2), found.group(3)) if found else None
+
+
+def check_lr12_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    _, _, own = dora_source(repo)
+    if own:
+        out.append(Result("A", "A1", OK, f"{DORA_TOOL} на місці, це курсова версія"))
+    elif repo.exists(DORA_TOOL):
+        out.append(
+            Result(
+                "A",
+                "A1",
+                FAIL,
+                f"{DORA_TOOL} відрізняється від курсового, а числа звіряються саме з ним",
+            )
+        )
+    else:
+        out.append(Result("A", "A1", FAIL, f"немає {DORA_TOOL}, заберіть його з гілки курсу"))
+
+    metrics = repo.read(METRICS_DOC)
+    if metrics is None:
+        return (
+            out
+            + [
+                Result("A", code, FAIL, f"немає {METRICS_DOC}")
+                for code in ("A2", "A3", "A4", "A5", "A6")
+            ]
+            + check_lr12_retro(repo)
+        )
+
+    window = metrics_window(repo)
+    if window is None:
+        out.append(
+            Result(
+                "A",
+                "A2",
+                FAIL,
+                f"у {METRICS_DOC} немає рядка «Команда для повторення» з --since, --until і "
+                "--split",
+            )
+        )
+    else:
+        out.append(Result("A", "A2", OK, f"вікно звіту задане: {window[0]} ... {window[1]}"))
+
+    rows = flat(metrics)
+    missing = [
+        name for name in METRIC_NAMES if not any(line.startswith(f"| {name} |") for line in rows)
+    ]
+    if missing:
+        out.append(Result("A", "A3", FAIL, "у зведенні немає рядків: " + ", ".join(missing)))
+    else:
+        out.append(Result("A", "A3", OK, "усі чотири метрики у зведенні є"))
+
+    weeks = [line for line in metrics.splitlines() if WEEK_ROW.match(line.strip())]
+    if len(weeks) >= 6:
+        out.append(Result("A", "A4", OK, f"таблиця по тижнях: рядків {len(weeks)}"))
+    else:
+        out.append(
+            Result("A", "A4", FAIL, f"у таблиці по тижнях {len(weeks)} рядків, потрібно від 6")
+        )
+
+    split = [line for line in metrics.splitlines() if SPLIT_ROW.match(line.strip())]
+    if len(split) >= 2:
+        out.append(Result("A", "A5", OK, "порівняння двох вікон на місці"))
+    else:
+        out.append(Result("A", "A5", FAIL, "немає таблиці «До і після» з рядками «до» і «від»"))
+
+    manual = doc_section(metrics, r"ручна звірка")
+    if manual is None:
+        out.append(Result("A", "A6", FAIL, f"у {METRICS_DOC} немає розділу «Ручна звірка»"))
+    elif not (ISSUE_REF.search(manual) or COMMIT_REF.search(manual)):
+        out.append(
+            Result(
+                "A",
+                "A6",
+                FAIL,
+                "у ручній звірці не названо, що саме перевірялось: потрібен номер pull "
+                "request або хеш коміту",
+            )
+        )
+    else:
+        out.append(Result("A", "A6", OK, "ручна звірка посилається на конкретну зміну"))
+
+    return out + check_lr12_retro(repo)
+
+
+def check_lr12_retro(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+    retro = repo.read(RETRO_DOC)
+    if retro is None:
+        return [Result("A", code, FAIL, f"немає {RETRO_DOC}") for code in ("A7", "A8", "A9", "A10")]
+
+    parts = {
+        "видно": doc_section(retro, r"що видно з цифр"),
+        "працювало": doc_section(retro, r"що працювало"),
+        "не працювало": doc_section(retro, r"що не працювало"),
+        "змінюю": doc_section(retro, r"що змінюю"),
+        "брешуть": doc_section(retro, r"брешуть"),
+    }
+    absent = [name for name, body in parts.items() if body is None]
+    if absent:
+        out.append(Result("A", "A7", FAIL, "у ретро немає розділів: " + ", ".join(absent)))
+    else:
+        out.append(Result("A", "A7", OK, "усі пʼять розділів ретро на місці"))
+
+    counts = {
+        "працювало": (len(wrapped_items(parts["працювало"] or "")), 3),
+        "не працювало": (len(wrapped_items(parts["не працювало"] or "")), 2),
+        "змінюю": (len(wrapped_items(parts["змінюю"] or "")), 3),
+    }
+    short = [f"{name}: {got} з {need}" for name, (got, need) in counts.items() if got < need]
+    if short:
+        out.append(Result("A", "A8", FAIL, "пунктів менше, ніж треба: " + "; ".join(short)))
+    else:
+        out.append(Result("A", "A8", OK, "три плюси, два мінуси і три зміни на місці"))
+
+    changes = wrapped_items(parts["змінюю"] or "")[:3]
+    undated = [item[:40] for item in changes if not ANY_DATE.search(item)]
+    if not changes:
+        out.append(Result("A", "A9", FAIL, "у розділі «Що змінюю» немає жодного пункту"))
+    elif undated:
+        out.append(Result("A", "A9", FAIL, "зміни без терміну: " + "; ".join(undated)))
+    elif not any(ISSUE_REF.search(item) for item in changes):
+        out.append(
+            Result(
+                "A",
+                "A9",
+                FAIL,
+                "жодна зміна не має сліду: одна з трьох робиться зараз і називає свою issue "
+                "або pull request номером",
+            )
+        )
+    else:
+        out.append(Result("A", "A9", OK, "три зміни з термінами, одна зі слідом"))
+
+    lies = parts["брешуть"] or ""
+    named = [name for name in METRIC_NAMES if name.lower()[:12] in lies.lower()]
+    if not lies.strip():
+        out.append(Result("A", "A10", FAIL, "розділ про брехливі цифри порожній"))
+    elif not named:
+        out.append(
+            Result(
+                "A",
+                "A10",
+                FAIL,
+                "не названо, яка саме метрика бреше: потрібна одна з чотирьох за назвою",
+            )
+        )
+    elif not re.search(r"\d", lies):
+        out.append(
+            Result("A", "A10", FAIL, "розділ про брехливі цифри написаний без жодного числа")
+        )
+    else:
+        out.append(Result("A", "A10", OK, "названа метрика і власне число: " + named[0]))
+
+    return out
+
+
+def check_lr12_numbers(repo: Repo) -> list[Result]:
+    codes = ("B1", "B2", "B3")
+    metrics = repo.read(METRICS_DOC)
+    window = metrics_window(repo)
+    if metrics is None or window is None:
+        return [Result("B", code, SKIP, "немає звіту з командою повторення") for code in codes]
+
+    script, origin, _ = dora_source(repo)
+    if script is None:
+        return [Result("B", code, SKIP, origin) for code in codes]
+
+    data = dora_json(script, repo, window)
+    if data is None:
+        return [
+            Result("B", code, SKIP, "скрипт метрик не відпрацював на цьому репозиторії")
+            for code in codes
+        ]
+    if data.get("pulls_source") != "api":
+        return [
+            Result("B", code, SKIP, f"дані pull request не прочитані: {data.get('pulls_source')}")
+            for code in codes
+        ]
+
+    have = flat(metrics)
+    hint = ""
+    try:
+        until = datetime.fromisoformat(window[1].replace("Z", "+00:00"))
+        if until.timestamp() > time.time():
+            hint = (
+                ". Вікно закінчується в майбутньому, тому кожен новий коміт міняє числа: "
+                "візьміть команду так, як її надрукував скрипт"
+            )
+    except ValueError:
+        pass
+    out: list[Result] = []
+    for code, key, label in (
+        ("B1", "summary_rows", "зведення"),
+        ("B2", "weekly_rows", "таблиця по тижнях"),
+        ("B3", "split_rows", "порівняння двох вікон"),
+    ):
+        expected = [re.sub(r"\s+", " ", line).strip() for line in data.get(key) or []]
+        if not expected:
+            out.append(Result("B", code, SKIP, f"{label}: скрипт нічого не порахував"))
+            continue
+        lost = [line for line in expected if line not in have]
+        if lost:
+            out.append(
+                Result(
+                    "B",
+                    code,
+                    FAIL,
+                    f"{label} розходиться зі скриптом ({origin}), перший рядок, якого немає: "
+                    + lost[0]
+                    + hint,
+                )
+            )
+        else:
+            out.append(
+                Result("B", code, OK, f"{label} збігається зі скриптом, рядків {len(expected)}")
+            )
+    return out
+
+
+def check_lr12_process(repo: Repo) -> list[Result]:
+    codes = ("C1", "C2")
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in codes]
+
+    out: list[Result] = []
+    ref = main_ref(repo)
+    landed = []
+    for name in (METRICS_DOC, RETRO_DOC):
+        if ref is None:
+            break
+        history = repo.run(["git", "log", ref, "--diff-filter=A", "--format=%H", "--", name])
+        shas = [line.strip() for line in history.stdout.splitlines() if line.strip()]
+        if shas:
+            landed.append((name, shas[-1]))
+    if len(landed) < 2:
+        out.append(
+            Result("C", "C1", FAIL, "у історії main немає комітів, які додали обидва документи")
+        )
+    else:
+        pulls = []
+        for name, sha in landed:
+            pull = commit_pull_request(repo, slug, sha)
+            if pull is None or not pull.get("merged_at"):
+                out.append(Result("C", "C1", FAIL, f"{name} приїхав у main не через pull request"))
+                break
+            pulls.append(pull.get("number"))
+        else:
+            out.append(
+                Result(
+                    "C",
+                    "C1",
+                    OK,
+                    "метрики і ретро приїхали через pull request "
+                    + ", ".join(f"#{number}" for number in sorted(set(pulls))),
+                )
+            )
+
+    retro = repo.read(RETRO_DOC) or ""
+    section = doc_section(retro, r"що змінюю") or ""
+    numbers = [int(value) for value in ISSUE_REF.findall(section)]
+    if not numbers:
+        out.append(
+            Result("C", "C2", FAIL, "у розділі «Що змінюю» немає номера issue чи pull request")
+        )
+        return out
+
+    closed = []
+    for number in numbers[:5]:
+        item = repo.gh_json(f"repos/{slug}/issues/{number}")
+        if not isinstance(item, dict):
+            continue
+        if item.get("state") == "closed":
+            kind = "pull request" if item.get("pull_request") else "issue"
+            closed.append(f"{kind} #{number}")
+    if closed:
+        out.append(Result("C", "C2", OK, "зміна з ретро закрита: " + ", ".join(closed)))
+    else:
+        out.append(
+            Result(
+                "C",
+                "C2",
+                FAIL,
+                "жодна зі змін, названих у ретро, не закрита: "
+                + ", ".join(f"#{number}" for number in numbers[:5]),
+            )
+        )
+    return out
+
+
+def run_lr12(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr11(repo, run_slow) + prefixed(
+        check_lr12_files(repo) + check_lr12_numbers(repo) + check_lr12_process(repo),
+        "ЛР12",
+    )
+
+
 CHECKS = {
     1: run_lr1,
     2: run_lr2,
@@ -4951,6 +5367,7 @@ CHECKS = {
     9: run_lr9,
     10: run_lr10,
     11: run_lr11,
+    12: run_lr12,
 }
 
 
