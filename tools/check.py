@@ -3115,7 +3115,515 @@ def run_lr7(repo: Repo, run_slow: bool) -> list[Result]:
         check_lr7_files(repo) + check_lr7_settings(repo, run_slow) + check_lr7_process(repo),
         "ЛР7",
     )
-CHECKS = {1: run_lr1, 2: run_lr2, 3: run_lr3, 4: run_lr4, 5: run_lr5, 6: run_lr6, 7: run_lr7}
+# --------------------------------------------------------------------------- #
+# ЛР8. Документація як код і onboarding
+# --------------------------------------------------------------------------- #
+
+README_SECTIONS = (
+    ("призначення", r"признач"),
+    ("вимоги", r"вимог"),
+    ("запуск", r"запуск"),
+    ("конфігурація", r"конфігур"),
+    ("тести", r"тест"),
+    ("документація", r"документац"),
+)
+
+RUNBOOK_SECTIONS = (
+    ("як запустити", r"запуст|запуск"),
+    ("як перевірити, що сервіс живий", r"жив|перевір|стан|health"),
+    ("де логи", r"лог"),
+    ("як відкотити", r"відкат|відкот|rollback"),
+)
+
+ONBOARDING_DOC = "docs/onboarding.md"
+PAGES_WORKFLOW = ".github/workflows/pages.yml"
+FALLBACK_ONBOARDING_REPO = "LyahovchukSergiy/sensor-log"
+ISSUE_LINK = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/issues/(\d+)")
+CODE_FENCE = re.compile(r"^\s*```", re.MULTILINE)
+MINUTES = re.compile(r"\b(\d{1,3})\s*(хвилин|хв\b|minute|min\b)", re.IGNORECASE)
+
+
+def added_at(repo: Repo, path: str) -> str | None:
+    """ISO-дата коміту, який додав файл. None, якщо файла в історії немає."""
+    done = repo.run(["git", "log", "--diff-filter=A", "--format=%cI", "--", path])
+    lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+def new_adr(repo: Repo) -> tuple[str | None, str]:
+    """Запис ADR, доданий у ЛР8, і пояснення, за яким правилом він вибраний.
+
+    ЛР3 вимагає рівно два ADR, ЛР8 просить один новий. Студент без ЛР3 пише
+    перший, і тоді новим є єдиний. В інших випадках спираємось на час: новий ADR
+    доданий пізніше за артефакти ЛР6 і ЛР7, а якщо їх немає, пізніше за решту ADR.
+    """
+    records = adr_files(repo)
+    if not records:
+        return None, "у docs/adr немає жодного запису"
+    if len(records) == 1:
+        return records[0], "ADR один, тому він і є новий"
+
+    dated = [(added_at(repo, name), name) for name in records]
+    dated = [(when, name) for when, name in dated if when]
+    if not dated:
+        return None, "дати додавання ADR не читаються з історії"
+    dated.sort()
+    when_newest, newest = dated[-1]
+
+    anchors = [added_at(repo, name) for name in ("docs/security.md", "CHANGELOG.md")]
+    anchors = [value for value in anchors if value]
+    if anchors:
+        anchor = max(anchors)
+        if when_newest > anchor:
+            return newest, "доданий пізніше за артефакти ЛР6 і ЛР7"
+        return None, (
+            f"найновіший ADR {newest} доданий раніше за артефакти ЛР6 і ЛР7: "
+            "схоже, нового запису в цій роботі не з'явилось"
+        )
+    if when_newest > dated[0][0]:
+        return newest, "доданий пізніше за решту ADR"
+    return None, "усі ADR додані одним комітом, новий запис не виділяється"
+
+
+def check_lr8_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    readme = repo.read("README.md") or ""
+    missing = [
+        title
+        for title, pattern in README_SECTIONS
+        if not re.search(rf"^#+\s*.*{pattern}", readme, re.IGNORECASE | re.MULTILINE)
+    ]
+    if missing:
+        out.append(Result("A", "A1", FAIL, "у README немає розділів: " + ", ".join(missing)))
+    else:
+        out.append(Result("A", "A1", OK, "README має всі шість розділів стандарту"))
+
+    docs_section = doc_section(readme, r"документац") or ""
+    has_docs = "docs/" in docs_section or "docs)" in docs_section
+    has_site = "github.io" in docs_section
+    if not docs_section:
+        out.append(
+            Result("A", "A2", SKIP, "немає розділу «Документація», нема де шукати посилання")
+        )
+    elif has_docs and has_site:
+        out.append(Result("A", "A2", OK, "розділ «Документація» веде і в docs, і на сайт"))
+    else:
+        lack = []
+        if not has_docs:
+            lack.append("на теку docs")
+        if not has_site:
+            lack.append("на сайт *.github.io")
+        out.append(
+            Result(
+                "A",
+                "A2",
+                FAIL,
+                "у розділі «Документація» README немає посилання " + " і ".join(lack),
+            )
+        )
+
+    index = repo.read("docs/index.md")
+    if index is None:
+        out.append(
+            Result(
+                "A",
+                "A3",
+                FAIL,
+                "docs/index.md не знайдено: без нього корінь сайту віддасть 404, "
+                "хоча прогін буде зелений",
+            )
+        )
+    else:
+        links = re.findall(r"\]\(([^)]+\.md)\)", index)
+        if len(links) >= 2:
+            out.append(
+                Result("A", "A3", OK, f"docs/index.md посилається на документи: {len(links)}")
+            )
+        else:
+            out.append(
+                Result(
+                    "A", "A3", FAIL, f"у docs/index.md посилань на .md {len(links)}, потрібно два"
+                )
+            )
+
+    pages = repo.read(PAGES_WORKFLOW)
+    if pages is None:
+        out.append(Result("A", "A4", FAIL, f"{PAGES_WORKFLOW} не знайдено"))
+    else:
+        problems = []
+        if "actions/deploy-pages" not in pages:
+            problems.append("немає кроку actions/deploy-pages")
+        if not re.search(r"source:\s*\./docs", pages):
+            problems.append("збирається не тека docs")
+        if problems:
+            out.append(Result("A", "A4", FAIL, f"{PAGES_WORKFLOW}: " + "; ".join(problems)))
+        else:
+            out.append(Result("A", "A4", OK, "workflow сайту на місці і збирає docs"))
+
+    record, why = new_adr(repo)
+    if record is None:
+        out.append(Result("A", "A5", FAIL, f"новий ADR не знайдений: {why}"))
+        out.append(Result("A", "A6", SKIP, "немає нового ADR, розділи перевіряти нема в чому"))
+    else:
+        out.append(Result("A", "A5", OK, f"новий ADR {record}: {why}"))
+        text = repo.read(record) or ""
+        gaps = [
+            section
+            for section in ADR_SECTIONS
+            if not re.search(rf"^#+\s*{section}", text, re.MULTILINE)
+        ]
+        if gaps:
+            out.append(Result("A", "A6", FAIL, f"у {record} немає розділів: " + ", ".join(gaps)))
+        elif not PR_LINK.search(text):
+            out.append(Result("A", "A6", FAIL, f"у {record} немає посилання на pull request"))
+        else:
+            out.append(
+                Result("A", "A6", OK, "новий ADR за шаблоном і з посиланням на pull request")
+            )
+
+    runbook = repo.read("docs/runbook.md")
+    if runbook is None:
+        out.append(Result("A", "A7", FAIL, "docs/runbook.md не знайдено"))
+        out.append(Result("A", "A8", SKIP, "немає runbook"))
+        out.append(Result("A", "A9", SKIP, "немає runbook"))
+    else:
+        gaps = [
+            title
+            for title, pattern in RUNBOOK_SECTIONS
+            if not re.search(rf"^#+\s*.*({pattern})", runbook, re.IGNORECASE | re.MULTILINE)
+        ]
+        if gaps:
+            out.append(Result("A", "A7", FAIL, "у runbook немає розділів: " + ", ".join(gaps)))
+        else:
+            out.append(Result("A", "A7", OK, "runbook має всі чотири розділи"))
+
+        fences = len(CODE_FENCE.findall(runbook)) // 2
+        if fences >= 3:
+            out.append(Result("A", "A8", OK, f"у runbook блоків з командами: {fences}"))
+        else:
+            out.append(
+                Result(
+                    "A",
+                    "A8",
+                    FAIL,
+                    f"у runbook блоків з командами {fences}, потрібно три: кожна дія це "
+                    "команда, яку можна скопіювати",
+                )
+            )
+
+        rollback = doc_section(runbook, r"відкат|відкот|rollback") or ""
+        if "docs/rollback.md" in rollback or "rollback.md" in rollback:
+            out.append(Result("A", "A9", OK, "розділ про відкат посилається на docs/rollback.md"))
+        elif "docker run" in rollback:
+            out.append(Result("A", "A9", OK, "розділ про відкат має команду відкату"))
+        else:
+            out.append(
+                Result(
+                    "A",
+                    "A9",
+                    FAIL,
+                    "у розділі про відкат немає ні посилання на docs/rollback.md, ні команди",
+                )
+            )
+
+    onboarding = repo.read(ONBOARDING_DOC)
+    if onboarding is None:
+        out.append(Result("A", "A10", FAIL, f"{ONBOARDING_DOC} не знайдено"))
+    else:
+        mine = doc_section(onboarding, r"звіт, який (написав|я)|мій звіт|написав я")
+        about = doc_section(onboarding, r"зауваження|про мій|про мене")
+        links = ISSUE_LINK.findall(onboarding)
+        problems = []
+        if mine is None:
+            problems.append("немає розділу про звіт, який ви написали")
+        if about is None:
+            problems.append("немає розділу про зауваження до вашого README")
+        if len(links) < 2:
+            problems.append(f"посилань на issue {len(links)}, потрібно два")
+        if problems:
+            out.append(Result("A", "A10", FAIL, f"{ONBOARDING_DOC}: " + "; ".join(problems)))
+        else:
+            out.append(Result("A", "A10", OK, "onboarding записаний в обидва боки"))
+
+    return out
+
+
+def pages_url(repo: Repo, slug: str) -> str:
+    """Адреса сайту документації.
+
+    Ендпойнт repos/{slug}/pages читається лише з дозволом pages: read, а
+    course-check.yml у студента створений на ЛР1 і такого дозволу не має, тому
+    основний шлях це вивести адресу з імені репозиторію. Перевірено 11.09.2026.
+    """
+    info = repo.gh_json(f"repos/{slug}/pages")
+    if isinstance(info, dict) and info.get("html_url"):
+        return str(info["html_url"])
+    owner, _, name = slug.partition("/")
+    return f"https://{owner.lower()}.github.io/{name}/"
+
+
+def onboarding_targets(repo: Repo, login: str) -> tuple[list[str], bool]:
+    """Репозиторії, у яких має лежати звіт студента, і чи це запасний об'єкт."""
+    entry, table = rotation_entry(login)
+    if entry is None or table is None:
+        return [FALLBACK_ONBOARDING_REPO], True
+    repos = {
+        item.get("github", "").lower(): item.get("repo", "") for item in table.get("students", [])
+    }
+    out = []
+    for name in entry.get("lr08") or []:
+        target = repos.get((name or "").lower()) if name else None
+        if target:
+            out.append(target)
+    if not out:
+        return [FALLBACK_ONBOARDING_REPO], True
+    return out, False
+
+
+def own_issues(repo: Repo, slug: str, creator: str | None) -> list[dict] | None:
+    """Issue репозиторію без pull request: цей ендпойнт віддає і те, і те."""
+    query = f"repos/{slug}/issues?state=all&per_page=100"
+    if creator:
+        query += f"&creator={creator}"
+    found = repo.gh_json(query)
+    if not isinstance(found, list):
+        return None
+    return [item for item in found if isinstance(item, dict) and "pull_request" not in item]
+
+
+def check_lr8_site(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+    slug = repo.slug()
+    if slug is None:
+        return [
+            Result("B", code, SKIP, "не видно remote origin") for code in ("B1", "B2", "B3", "B4")
+        ]
+
+    url = pages_url(repo, slug)
+    status = http_status(url, {})
+    if status == 200:
+        out.append(Result("B", "B1", OK, f"сайт документації відповідає анонімно: {url}"))
+    elif status == 404:
+        out.append(
+            Result(
+                "B",
+                "B1",
+                FAIL,
+                f"{url} віддає 404. Найчастіша причина це відсутній docs/index.md, "
+                "друга це джерело Pages у Settings не переведене на GitHub Actions",
+            )
+        )
+    elif status is None:
+        out.append(
+            Result("B", "B1", SKIP, f"{url} не відповів, мережі немає або сайт ще піднімається")
+        )
+    else:
+        out.append(Result("B", "B1", FAIL, f"{url} віддає {status}, а не 200"))
+
+    if not repo.gh_available():
+        out.append(Result("B", "B2", SKIP, "потрібен gh"))
+        out.append(Result("B", "B3", SKIP, "потрібен gh"))
+        out.append(Result("B", "B4", SKIP, "потрібен gh"))
+        return out
+
+    runs = repo.gh_json(f"repos/{slug}/actions/workflows/pages.yml/runs?branch=main&per_page=1")
+    items = (runs or {}).get("workflow_runs") if isinstance(runs, dict) else None
+    if not items:
+        out.append(Result("B", "B2", FAIL, "прогонів workflow сайту на main не знайдено"))
+    elif items[0].get("conclusion") == "success":
+        out.append(Result("B", "B2", OK, "останній прогін workflow сайту зелений"))
+    else:
+        out.append(
+            Result(
+                "B",
+                "B2",
+                FAIL,
+                f"останній прогін workflow сайту: {items[0].get('conclusion')}",
+            )
+        )
+
+    login = slug.split("/")[0]
+    targets, spare = onboarding_targets(repo, login)
+    if not spare:
+        targets = targets + [FALLBACK_ONBOARDING_REPO]
+    report = None
+    where = None
+    unreadable = []
+    for target in targets:
+        found = own_issues(repo, target, login)
+        if found is None:
+            unreadable.append(target)
+            continue
+        if found:
+            report, where = found[0], target
+            break
+
+    if report is None and len(unreadable) == len(targets):
+        out.append(Result("B", "B3", SKIP, "не вдалося прочитати: " + ", ".join(unreadable)))
+        out.append(Result("B", "B4", SKIP, "звіт не знайдений"))
+        return out
+
+    if report is None:
+        looked = ", ".join(targets)
+        out.append(
+            Result(
+                "B",
+                "B3",
+                FAIL,
+                f"issue зі звітом від {login} не знайдена в: {looked}. "
+                "Звіт заводиться в репозиторії, README якого ви проходили",
+            )
+        )
+        out.append(Result("B", "B4", SKIP, "звіту немає, перевіряти нема чого"))
+        return out
+
+    note = " (запасний об'єкт курсу)" if where == FALLBACK_ONBOARDING_REPO else ""
+    out.append(Result("B", "B3", OK, f"звіт у {where}#{report.get('number')}{note}"))
+
+    body = report.get("body") or ""
+    problems = []
+    if len(body.encode("utf-8")) < 400:
+        problems.append(f"тіло звіту {len(body.encode('utf-8'))} байтів із 400")
+    if not MINUTES.search(body):
+        problems.append("не названий час проходу в хвилинах")
+    if len(list_items(body)) < 3:
+        problems.append(f"пунктів списку {len(list_items(body))}, потрібно три пропозиції")
+    leaks = [
+        label for pattern, label in REAL_DATA_PATTERNS if re.search(pattern, body, re.IGNORECASE)
+    ]
+    if leaks:
+        out.append(
+            Result(
+                "B",
+                "B4",
+                FAIL,
+                "у публічному звіті схоже на персональні дані: " + ", ".join(leaks),
+            )
+        )
+    elif problems:
+        out.append(Result("B", "B4", FAIL, "звіт неповний: " + "; ".join(problems)))
+    else:
+        out.append(Result("B", "B4", OK, "у звіті є час, пропозиції і немає персональних даних"))
+
+    return out
+
+
+def check_lr8_process(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [
+            Result("C", code, SKIP, "потрібен gh і remote origin") for code in ("C1", "C2", "C3")
+        ]
+
+    record, _ = new_adr(repo)
+    adr_pull = None
+    if record is None:
+        out.append(Result("C", "C1", SKIP, "новий ADR не знайдений"))
+    else:
+        log = repo.run(["git", "log", "--diff-filter=A", "--format=%H", "--", record])
+        shas = [line.strip() for line in log.stdout.splitlines() if line.strip()]
+        adr_pull = commit_pull_request(repo, slug, shas[-1]) if shas else None
+        if adr_pull is None:
+            out.append(Result("C", "C1", FAIL, f"{record} не прийшов у main через pull request"))
+        elif not adr_pull.get("merged_at"):
+            out.append(
+                Result(
+                    "C", "C1", FAIL, f"pull request #{adr_pull.get('number')} з ADR не змержений"
+                )
+            )
+        else:
+            out.append(
+                Result(
+                    "C", "C1", OK, f"новий ADR прийшов через pull request #{adr_pull.get('number')}"
+                )
+            )
+
+    login = slug.split("/")[0]
+    mine = own_issues(repo, slug, None)
+    if mine is None:
+        out.append(Result("C", "C2", SKIP, "issue власного репозиторію не прочитались"))
+        out.append(Result("C", "C3", SKIP, "немає issue зі звітом"))
+        return out
+
+    foreign = [
+        item for item in mine if (item.get("user") or {}).get("login", "").lower() != login.lower()
+    ]
+    if not foreign:
+        out.append(
+            Result(
+                "C",
+                "C2",
+                SKIP,
+                "issue зі звітом про вас у репозиторії немає. Якщо п'ятий день минув, "
+                "напишіть рядок в issue «Ротація рев'ю 2026»: зауваження дасть викладач",
+            )
+        )
+        out.append(Result("C", "C3", SKIP, "немає звіту про вас, закривати нема чого"))
+        return out
+
+    report = min(foreign, key=lambda item: item.get("created_at") or "")
+    created = report.get("created_at") or ""
+    out.append(
+        Result(
+            "C",
+            "C2",
+            OK,
+            f"звіт про ваш README: issue #{report.get('number')} від "
+            f"{(report.get('user') or {}).get('login')}",
+        )
+    )
+
+    pulls = repo.gh_json(
+        f"repos/{slug}/pulls?state=closed&sort=updated&direction=desc&per_page=100"
+    )
+    later = []
+    for item in pulls or []:
+        if not isinstance(item, dict) or not item.get("merged_at"):
+            continue
+        if created and item["merged_at"] <= created:
+            continue
+        if adr_pull and item.get("number") == adr_pull.get("number"):
+            continue
+        files = repo.gh_json(f"repos/{slug}/pulls/{item['number']}/files")
+        names = {entry.get("filename") for entry in files or [] if isinstance(entry, dict)}
+        if "README.md" in names or ONBOARDING_DOC in names:
+            later.append(item)
+
+    if later:
+        numbers = ", ".join(f"#{item['number']}" for item in later[:3])
+        out.append(Result("C", "C3", OK, f"зауваження закриті окремим pull request: {numbers}"))
+    else:
+        out.append(
+            Result(
+                "C",
+                "C3",
+                FAIL,
+                f"після issue #{report.get('number')} немає змердженого pull request, який "
+                "змінює README.md або docs/onboarding.md і не є тим, що приніс ADR",
+            )
+        )
+    return out
+
+
+def run_lr8(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr7(repo, run_slow) + prefixed(
+        check_lr8_files(repo) + check_lr8_site(repo) + check_lr8_process(repo),
+        "ЛР8",
+    )
+
+
+CHECKS = {
+    1: run_lr1,
+    2: run_lr2,
+    3: run_lr3,
+    4: run_lr4,
+    5: run_lr5,
+    6: run_lr6,
+    7: run_lr7,
+    8: run_lr8,
+}
 
 
 def render(results: list[Result], lr: int) -> str:
