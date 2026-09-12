@@ -3647,6 +3647,39 @@ def source_files(repo: Repo) -> list[str]:
     ]
 
 
+def middleware_guards_exceptions(repo: Repo) -> tuple[bool | None, str]:
+    """Чи обгорнутий `call_next` у try з обробником.
+
+    Перевіряється розбором, а не текстом: слово try у файлі нічого не означає.
+    None, якщо middleware не знайдено взагалі.
+    """
+    for name in source_files(repo):
+        try:
+            tree = ast.parse(repo.read(name) or "")
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            awaits = [
+                inner
+                for inner in ast.walk(node)
+                if isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "call_next"
+            ]
+            if not awaits:
+                continue
+            guarded = any(
+                any(call in ast.walk(block) for block in tries.body)
+                for tries in ast.walk(node)
+                if isinstance(tries, ast.Try) and tries.handlers
+                for call in awaits
+            )
+            return guarded, f"{name}, функція {node.name}"
+    return None, "middleware з call_next не знайдено"
+
+
 def check_lr9_files(repo: Repo) -> list[Result]:
     out: list[Result] = []
 
@@ -3733,6 +3766,22 @@ def check_lr9_files(repo: Repo) -> list[Result]:
                     "порахуйте бюджет, а не лише ціль",
                 )
             )
+
+    guarded, where = middleware_guards_exceptions(repo)
+    if guarded is None:
+        out.append(Result("A", "A9", FAIL, "middleware з call_next не знайдено"))
+    elif guarded:
+        out.append(Result("A", "A9", OK, f"падіння всередині ендпойнта логується ({where})"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A9",
+                FAIL,
+                f"call_next у {where} не обгорнутий у try: падіння пройде повз лог і "
+                "лічильники, а доступність лишиться стовідсотковою",
+            )
+        )
 
     runbook = repo.read("docs/runbook.md")
     if runbook is None:
@@ -4060,6 +4109,301 @@ def run_lr9(repo: Repo, run_slow: bool) -> list[Result]:
     )
 
 
+# --------------------------------------------------------------------------- #
+# ЛР10. Інцидент і blameless postmortem
+# --------------------------------------------------------------------------- #
+
+ARCHIVE_MODULE = "src/app/archive.py"
+HOOK = "window.observe"
+PM_NAME = re.compile(r"docs/postmortems/\d{4}-\d{2}-\d{2}-[^/]+\.md")
+PM_SECTIONS = (
+    ("таймлайн", r"таймлайн|timeline|хронолог"),
+    ("вплив", r"вплив|impact"),
+    ("корінні причини", r"причин|root cause"),
+    ("що спрацювало", r"що спрацювало|спрацювало"),
+    ("що не спрацювало", r"що не спрацювало|не спрацювало"),
+    ("дії", r"^\W*дії|action items|дії\b"),
+)
+CLOCK = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?\b")
+PR_NUMBER = re.compile(r"#(\d+)|/pull/(\d+)")
+DONE_WORD = re.compile(r"зроблен|виконан|done|closed", re.IGNORECASE)
+
+
+def postmortems(repo: Repo) -> list[str]:
+    return sorted(name for name in repo.tracked_files() if PM_NAME.fullmatch(name))
+
+
+def check_lr10_files(repo: Repo) -> list[Result]:
+    out: list[Result] = []
+
+    seen = repo.run(["git", "log", "--format=%H", "--", ARCHIVE_MODULE])
+    in_history = [line for line in seen.stdout.splitlines() if line.strip()]
+    if repo.exists(ARCHIVE_MODULE):
+        out.append(Result("A", "A1", OK, "модуль колеги на місці"))
+    elif in_history:
+        # Повний відкат злиття прибирає і сам модуль. Це законний спосіб закрити
+        # інцидент, тому дивимось не лише в дерево, а й в історію.
+        out.append(Result("A", "A1", OK, "модуль був у репозиторії і поїхав разом з відкатом"))
+    else:
+        out.append(Result("A", "A1", FAIL, f"{ARCHIVE_MODULE} немає ні в дереві, ні в історії"))
+
+    wired = [name for name in source_files(repo) if HOOK in (repo.read(name) or "")]
+    history = repo.run(["git", "log", "--format=%H", "-S", HOOK, "main"])
+    ever = [line for line in history.stdout.splitlines() if line.strip()]
+    if wired:
+        out.append(Result("A", "A2", OK, "модуль підключений у " + ", ".join(wired)))
+    elif ever:
+        out.append(
+            Result("A", "A2", OK, f"модуль був підключений і відкочений, комітів: {len(ever)}")
+        )
+    else:
+        out.append(
+            Result("A", "A2", FAIL, f"{HOOK} не зустрічається ні в дереві, ні в історії main")
+        )
+
+    records = postmortems(repo)
+    if not records:
+        out.append(
+            Result(
+                "A",
+                "A3",
+                FAIL,
+                "у docs/postmortems немає файла виду РРРР-ММ-ДД-назва.md",
+            )
+        )
+        for code in ("A4", "A5", "A6", "A7", "A8"):
+            out.append(Result("A", code, SKIP, "немає постмортему"))
+        return out + check_lr10_runbook(repo)
+
+    name = records[-1]
+    text = repo.read(name) or ""
+    out.append(Result("A", "A3", OK, f"постмортем {name}"))
+
+    sections: dict[str, str] = {}
+    missing = []
+    for title, pattern in PM_SECTIONS:
+        body = doc_section(text, pattern)
+        if body is None:
+            missing.append(title)
+        else:
+            sections[title] = body
+    if missing:
+        out.append(Result("A", "A4", FAIL, "у постмортемі немає розділів: " + ", ".join(missing)))
+    else:
+        out.append(Result("A", "A4", OK, "усі шість розділів шаблону"))
+
+    stamps = CLOCK.findall(sections.get("таймлайн", ""))
+    if len(stamps) >= 5:
+        out.append(Result("A", "A5", OK, f"позначок часу в таймлайні: {len(stamps)}"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A5",
+                FAIL,
+                f"у таймлайні {len(stamps)} позначок часу, потрібно п'ять: старт, перша "
+                "помилка, момент виявлення, причина, відновлення",
+            )
+        )
+
+    impact = sections.get("вплив", "")
+    numbers = re.findall(r"\b\d+\b", impact)
+    if len(numbers) >= 2:
+        out.append(Result("A", "A6", OK, f"у розділі про вплив чисел: {len(numbers)}"))
+    else:
+        out.append(
+            Result(
+                "A",
+                "A6",
+                FAIL,
+                "у розділі про вплив немає чисел: скільки запитів і за який час",
+            )
+        )
+
+    actions = sections.get("дії", "")
+    rows = [
+        line
+        for line in actions.splitlines()
+        if line.strip().startswith("|")
+        and line.count("|") >= 4
+        and not re.match(r"^\s*\|[\s|:-]+\|\s*$", line)
+    ]
+    rows = [
+        line for line in rows if not re.search(r"відповідальн|власник|термін", line, re.IGNORECASE)
+    ]
+    done = [line for line in rows if DONE_WORD.search(line) and PR_NUMBER.search(line)]
+    if len(rows) < 3:
+        out.append(
+            Result("A", "A7", FAIL, f"у таблиці дій {len(rows)} рядків з даними, потрібно три")
+        )
+    elif not done:
+        out.append(
+            Result(
+                "A",
+                "A7",
+                FAIL,
+                "жодна дія не має стану «зроблено» разом з номером pull request",
+            )
+        )
+    else:
+        out.append(Result("A", "A7", OK, f"дій {len(rows)}, з них виконана {len(done)}"))
+
+    slug = repo.slug()
+    owner = slug.split("/")[0] if slug else ""
+    causes = sections.get("корінні причини", "")
+    if not owner:
+        out.append(
+            Result("A", "A8", SKIP, "не видно remote origin, імені власника не з чим звіряти")
+        )
+        return out + check_lr10_runbook(repo)
+    if re.search(re.escape(owner), causes, re.IGNORECASE):
+        out.append(
+            Result(
+                "A",
+                "A8",
+                FAIL,
+                f"у розділі причин згадано {owner}: причина це умова в системі, а не людина",
+            )
+        )
+    else:
+        out.append(Result("A", "A8", OK, "у розділі причин немає імені власника репозиторію"))
+
+    return out + check_lr10_runbook(repo)
+
+
+def check_lr10_runbook(repo: Repo) -> list[Result]:
+    runbook = repo.read("docs/runbook.md")
+    if runbook is None:
+        return [Result("A", "A9", FAIL, "docs/runbook.md не знайдено")]
+    body = doc_section(runbook, r"500|інцидент|аварі|помилк")
+    if body is None:
+        return [
+            Result(
+                "A",
+                "A9",
+                FAIL,
+                "у runbook немає розділу про цей клас аварій",
+            )
+        ]
+    if "```" not in body:
+        return [Result("A", "A9", FAIL, "у розділі про аварію немає команд, які копіюються")]
+    return [Result("A", "A9", OK, "runbook має розділ про аварію з командами")]
+
+
+def check_lr10_service(repo: Repo, run_slow: bool) -> list[Result]:
+    if not run_slow:
+        return [Result("B", "B1", SKIP, "сервіс не піднімався, додайте --slow")]
+
+    port = free_port()
+    env = dict(
+        os.environ,
+        APP_HOST="127.0.0.1",
+        APP_PORT=str(port),
+        APP_ENV=os.environ.get("APP_ENV") or "local",
+        APP_RELOAD="0",
+        PYTHONPATH=str(repo.path / "src"),
+    )
+    python = repo.path / ".venv" / "bin" / "python"
+    interpreter = str(python) if python.exists() else sys.executable
+    base = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [interpreter, "-m", "app"],
+        cwd=repo.path,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(30):
+            time.sleep(1)
+            if http_status(f"{base}/health", {}) == 200:
+                break
+        else:
+            return [Result("B", "B1", FAIL, "сервіс не відповів на /health за 30 секунд")]
+
+        codes = [http_status(f"{base}/items", {}) for _ in range(9)]
+        broken = [code for code in codes if code is not None and code >= 500]
+        if broken:
+            return [
+                Result(
+                    "B",
+                    "B1",
+                    FAIL,
+                    f"з девʼяти запитів на /items {len(broken)} відповіли 500: "
+                    "інцидент не закритий, аварія досі в main",
+                )
+            ]
+        return [Result("B", "B1", OK, "сервіс після інциденту живий, девʼять запитів без 500")]
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def check_lr10_process(repo: Repo) -> list[Result]:
+    slug = repo.slug()
+    if not repo.gh_available() or slug is None:
+        return [Result("C", code, SKIP, "потрібен gh і remote origin") for code in ("C1", "C2")]
+
+    history = repo.run(["git", "log", "--format=%H", "-S", HOOK, "main"])
+    shas = [line.strip() for line in history.stdout.splitlines() if line.strip()]
+    if not shas:
+        out = [Result("C", "C1", FAIL, f"у main немає коміту, який підключив {HOOK}")]
+    else:
+        pull = commit_pull_request(repo, slug, shas[-1])
+        if pull is None:
+            out = [Result("C", "C1", WARN, "підключення модуля не прийшло через pull request")]
+        else:
+            out = [
+                Result(
+                    "C",
+                    "C1",
+                    OK,
+                    f"аварія приїхала в main через pull request #{pull.get('number')}",
+                )
+            ]
+
+    records = postmortems(repo)
+    if not records:
+        out.append(Result("C", "C2", SKIP, "немає постмортему"))
+        return out
+
+    text = repo.read(records[-1]) or ""
+    actions = doc_section(text, r"^\W*дії|action items|дії\b") or ""
+    numbers = {int(one or two) for one, two in PR_NUMBER.findall(actions)}
+    if not numbers:
+        out.append(Result("C", "C2", FAIL, "у таблиці дій немає номера pull request"))
+        return out
+
+    merged = []
+    for number in sorted(numbers):
+        pull = repo.gh_json(f"repos/{slug}/pulls/{number}")
+        if isinstance(pull, dict) and pull.get("merged_at"):
+            merged.append(number)
+    if merged:
+        out.append(
+            Result(
+                "C",
+                "C2",
+                OK,
+                "дія приїхала змерженим pull request: " + ", ".join(f"#{n}" for n in merged),
+            )
+        )
+    else:
+        listed = ", ".join(f"#{n}" for n in sorted(numbers))
+        out.append(Result("C", "C2", FAIL, f"pull request з таблиці дій не змержений: {listed}"))
+    return out
+
+
+def run_lr10(repo: Repo, run_slow: bool) -> list[Result]:
+    return run_lr9(repo, run_slow) + prefixed(
+        check_lr10_files(repo) + check_lr10_service(repo, run_slow) + check_lr10_process(repo),
+        "ЛР10",
+    )
+
+
 CHECKS = {
     1: run_lr1,
     2: run_lr2,
@@ -4070,6 +4414,7 @@ CHECKS = {
     7: run_lr7,
     8: run_lr8,
     9: run_lr9,
+    10: run_lr10,
 }
 
 
